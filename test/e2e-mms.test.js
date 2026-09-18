@@ -58,12 +58,24 @@ test("endstreaming is honoured once enough is buffered, startstreaming resumes",
     await page.goto(`${PLAYER}#/v/BV1btrTEST01`);
     await tap(page);
     await playing(page, 1);
+    // Well past the 15 s the engine insists on keeping ahead even when the browser says "not now",
+    // with room for the 9 s of playback the check below takes.
     await waitFor(async () => {
       const video = await inApp.video(page);
-      return video.buffered.length && video.buffered.at(-1)[1] - video.currentTime > 22;
-    }, { timeout: 60000, message: "22 s buffered ahead" });
+      return video.buffered.length && video.buffered.at(-1)[1] - video.currentTime > 30;
+    }, { timeout: 60000, message: "30 s buffered ahead" });
     await page.evaluate(() => window.__mmsSetStreaming(false));
-    await new Promise((resolve) => setTimeout(resolve, 5000)); // requests already in flight may finish
+    // The batch of segments already under way is allowed to finish: wait until the byte counter has
+    // been still for two seconds (at most 25 s), then watch it for four more.
+    let settled = totalBytes();
+    let stillSince = Date.now();
+    const settleStart = Date.now();
+    while (Date.now() - settleStart < 25000) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const bytes = totalBytes();
+      if (bytes !== settled) { settled = bytes; stillSince = Date.now(); }
+      if (Date.now() - stillSince >= 2000) break;
+    }
     const paused = totalBytes();
     await new Promise((resolve) => setTimeout(resolve, 4000));
     assert.ok(totalBytes() - paused < 64 * 1024, `downloads should rest while the browser says "not now" (got ${totalBytes() - paused} bytes)`);

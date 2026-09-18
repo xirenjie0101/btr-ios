@@ -6,7 +6,7 @@
 #!tag = 哔哩哔哩, 诊断
 #!system = iOS, iPadOS
 #!date = 2026-09-18
-#!version = 1.2.0
+#!version = 1.3.0
 
 [General]
 # 官方 App 有一部分取流走明文 HTTP 和非标准端口，让这些也经过 Loon 的 HTTP 引擎才能看到请求头

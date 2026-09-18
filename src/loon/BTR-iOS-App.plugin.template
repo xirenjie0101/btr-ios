@@ -35,6 +35,7 @@ AND,((DOMAIN,m.bilibili.com),(PROTOCOL,QUIC)),REJECT
 
 [Script]
 http-request ^https?:\/\/[^\/]+\/upgcxcode\/.+\.m4s script-path=__BTRI_APP_SCRIPT_URL__, tag=BTR App 模式, timeout=30, argument=[{conns},{ahead},{cache},{cdn},{openEnded},{notify}]
+http-request ^https?:\/\/[^\/]+(?::\d+)?\/v1\/resource\/.+\.m4s script-path=__BTRI_APP_SCRIPT_URL__, tag=BTR App 模式（其他取流方式，仅统计）, timeout=10, argument=[{conns},{ahead},{cache},{cdn},{openEnded},{notify}]
 http-request ^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__ script-path=__BTRI_APP_SCRIPT_URL__, tag=BTR App 模式统计页, timeout=10, argument=[{conns},{ahead},{cache},{cdn},{openEnded},{notify}]
 
 [MITM]

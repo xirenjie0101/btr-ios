@@ -34,14 +34,17 @@ var BTRA_OVERSEAS = [
   "upos-sz-mirrorcosov.bilivideo.com", "upos-sz-mirroraliov.bilivideo.com",
   "cn-hk-eq-01-01.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com"
 ];
-var BTRA_SLICE_MS = 1500;             // every connection is given what it should deliver in this time
+var BTRA_SLICE_MS = 1000;             // every connection is given what it should deliver in this time
+var BTRA_EXTRA_SHARE = 0.8;            // read-ahead pieces are cut a little shorter, so they land first
+var BTRA_BUSY_KEY = "btr_ios_app_busy";
+var BTRA_BUSY_MS = 2500;               // how long a connection started by another run is assumed to be in use
 var BTRA_ASSUMED_BPS = 40;             // bytes per ms assumed for a mirror nobody has measured (≈ 40 KB/s)
 var BTRA_PER_HOST = 6;                 // connections to one mirror at a time (iOS queues more than that)
 var BTRA_MIN_SLOT = 32 * 1024;
-var BTRA_MAX_PIECE = 512 * 1024;
+var BTRA_MAX_PIECE = 1024 * 1024;
 var BTRA_MAX_BATCH = 8 * 1024 * 1024;
 var BTRA_MAX_REPLY = 8 * 1024 * 1024;
-var BTRA_EXACT_LIMIT = 4 * 1024 * 1024;
+var BTRA_EXACT_LIMIT = 2 * 1024 * 1024;
 var BTRA_OPEN_REPLY = 2 * 1024 * 1024;
 var BTRA_PIECE_TIMEOUT = 9000;
 var BTRA_HEDGE_BUDGET = 4;
@@ -194,7 +197,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
    */
 
   function emptyState() {
-    return { v: 2, since: Date.now(), rr: 0, totals: {}, hosts: {}, recent: [], breaker: {}, streaks: {}, notes: {}, stats: {}, cache: [], heads: {}, flags: {} };
+    return { v: 2, since: Date.now(), rr: 0, totals: {}, hosts: {}, recent: [], breaker: {}, streaks: {}, notes: {}, stats: {}, cache: [], heads: {}, flags: {}, runs: [] };
   }
 
   function loadState() {
@@ -238,6 +241,9 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     else if (kind === "streak") state.streaks[op[1]] = op[2] === null ? 0 : (state.streaks[op[1]] || 0) + op[2];
     else if (kind === "note") state.notes[op[1]] = op[2];
     else if (kind === "flag") state.flags[op[1]] = op[2];
+    else if (kind === "run") { state.runs.push(op[1]); while (state.runs.length > 12) state.runs.shift(); }
+    else if (kind === "min") state.stats[op[1]] = state.stats[op[1]] ? Math.min(state.stats[op[1]], op[2]) : op[2];
+    else if (kind === "max") state.stats[op[1]] = Math.max(state.stats[op[1]] || 0, op[2]);
     else if (kind === "head") state.heads[op[1]] = { pos: op[2], t: op[3] };
     else if (kind === "cadd") state.cache.push(op[1]);
     else if (kind === "cdel") state.cache = state.cache.filter(function (entry) { return entry.k !== op[1]; });
@@ -319,16 +325,49 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     if (finished) return;
     finished = true;
     commit();
+    busyClear();
     $done(result);
   }
 
   var currentKey = null;
   var currentStart = 0;
+  var currentAsked = 0;
+  var runId = startedAt.toString(36) + Math.floor(Math.random() * 1679616).toString(36);
+  var busyNoted = false;
+
+  function busyNote(hosts) {
+    try {
+      var busy = JSON.parse($persistentStore.read(BTRA_BUSY_KEY) || "{}") || {};
+      var now = Date.now();
+      for (var index = 0; index < hosts.length; index += 1) {
+        var stamps = (busy[hosts[index]] || []).filter(function (stamp) { return stamp.r !== runId && now - stamp.t < BTRA_BUSY_MS; });
+        stamps.push({ t: now, r: runId });
+        busy[hosts[index]] = stamps;
+      }
+      for (var host in busy) if (!busy[host].length) delete busy[host];
+      $persistentStore.write(JSON.stringify(busy), BTRA_BUSY_KEY);
+      busyNoted = true;
+    } catch (_error) {}
+  }
+
+  function busyClear() {
+    if (!busyNoted) return;
+    try {
+      var busy = JSON.parse($persistentStore.read(BTRA_BUSY_KEY) || "{}") || {};
+      var now = Date.now();
+      for (var host in busy) {
+        busy[host] = busy[host].filter(function (stamp) { return stamp.r !== runId && now - stamp.t < BTRA_BUSY_MS; });
+        if (!busy[host].length) delete busy[host];
+      }
+      $persistentStore.write(JSON.stringify(busy), BTRA_BUSY_KEY);
+    } catch (_error) {}
+  }
 
   function passThrough(reason) {
     change("bump", "passed", 1);
     if (reason) change("set", "lastPass", reason);
     if (currentKey !== null) change("rdone", currentKey, currentStart, startedAt, "pass", Date.now() - startedAt);
+    change("run", { k: "pass", a: currentAsked, ms: Date.now() - startedAt, r: reason || "" });
     finish({});
   }
 
@@ -469,6 +508,16 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var testText = !test ? "还没做" : test.ok ? "通过（1 MB：编码 " + test.encMs + " ms · 写入 " + test.writeMs + " ms · 读取 " + test.readMs + " ms · 解码 " + test.decMs + " ms）" : "没通过" + (test.error ? "：" + test.error : "");
     var misses = stats.misses || 0;
     var hits = stats.hits || 0;
+    var runLines = [];
+    var kinds = { hit: "命中", part: "部分命中", miss: "未命中", pass: "放行", fail: "失败" };
+    for (var ri = current.runs.length - 1; ri >= 0; ri -= 1) {
+      var run = current.runs[ri];
+      var line = kinds[run.k] + " " + sizeText(run.a || 0);
+      if (run.k === "hit") line += " · " + run.ms + " ms";
+      else if (run.k === "miss" || run.k === "part") line += " → 取回 " + sizeText(run.f || 0) + " · App 部分 " + run.m + " ms · 全部 " + run.ms + " ms · " + run.p + " 块 / " + run.n + " 条 · 容量 " + sizeText(run.c || 0) + (run.sh ? " · 分块答复" : "");
+      else line += " · " + run.ms + " ms · " + (run.r || "");
+      runLines.push(escapeHtml(line));
+    }
     var hist = "≤256K " + (stats.h256 || 0) + " · ≤1M " + (stats.h1m || 0) + " · ≤2M " + (stats.h2m || 0) + " · ≤4M " + (stats.h4m || 0) + " · >4M " + (stats.hbig || 0);
     var rows = [
       ["版本", escapeHtml(BTRA_VERSION)],
@@ -476,7 +525,8 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       ["统计起点", escapeHtml(new Date(current.since).toLocaleString())],
       ["看到的取流请求", escapeHtml((stats.seen || 0) + " 个（小段 " + (stats.bounded || 0) + " · 开放式 " + (stats.open || 0) + " · 无 Range " + (stats.none || 0) + " · 其他 " + (stats.other || 0) + "）")],
       ["请求大小分布", escapeHtml(hist + " · 最大 " + sizeText(stats.maxAsked || 0))],
-      ["重复位置", escapeHtml((stats.dups || 0) + " 次：上一次答复还没完成 " + (stats.dupPending || 0) + " · 上次答得慢 " + (stats.dupSlow || 0) + " · 上次答得快 " + (stats.dupQuick || 0) + " · 上次是分块答复 " + (stats.dupShort || 0) + " · 上次放行/失败 " + (stats.dupFail || 0))],
+      ["重复位置", escapeHtml((stats.dups || 0) + " 次：上一次答复还没完成 " + (stats.dupPending || 0) + " · 上次答得慢 " + (stats.dupSlow || 0) + " · 上次答得快 " + (stats.dupQuick || 0) + " · 上次是分块答复 " + (stats.dupShort || 0) + " · 上次放行/失败 " + (stats.dupFail || 0) + (stats.dupAfterMinMs ? "（重问之前那次答复用了 " + stats.dupAfterMinMs + "～" + stats.dupAfterMaxMs + " ms）" : ""))],
+      ["其他取流方式", escapeHtml((stats.otherMedia || 0) + " 个 MCDN/PCDN 请求（未加速，原样放行）" + (stats.otherHost ? " · 最近：" + stats.otherHost : ""))],
       ["缓存命中", escapeHtml(hits + " 次（平均 " + average(stats.hitMs, hits) + " ms）· 部分命中 " + (stats.partial || 0) + " 次 · 未命中 " + misses + " 次")],
       ["未命中耗时", escapeHtml("平均：准备 " + average(stats.prepMs, stats.batches) + " ms · App 要的部分到手 " + average(stats.mustMs, stats.batches) + " ms · 整批到手 " + average(stats.allMs, stats.batches) + " ms · 超过 4 秒的答复 " + (stats.slowRuns || 0) + " 次")],
       ["多线程取回", escapeHtml((stats.batches || 0) + " 批 · " + sizeText(stats.fetched || 0) + " · " + (stats.pieces || 0) + " 个子块 · 平均 " + (stats.bps ? Math.round(stats.bps * 1000 / 1024) : 0) + " KB/s（每批）· 上一批容量 " + sizeText(stats.lastCapacity || 0) + " / " + (BTRA_SLICE_MS / 1000) + " 秒")],
@@ -488,6 +538,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       ["保险丝", breakers.length ? breakers.join("<br>") : "没有跳闸"],
       ["节点", hosts.length ? hosts.join("<br>") : "还没有记录"],
       ["答复之后才到的块", escapeHtml((stats.late || 0) + " 块补存进了缓存（Loon 通常在答复后立刻结束脚本，所以这个数一般是 0）")],
+      ["最近 12 次", runLines.length ? runLines.join("<br>") : "还没有记录"],
       ["App 标识", escapeHtml(stats.agent || "还没有记录")]
     ];
     var html = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
@@ -515,6 +566,15 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       return;
     }
     var parts = /^(https?):\/\/([^/:?#]+)(?::(\d+))?(\/[^?#]*)(\?[^#]*)?/i.exec(url);
+    if (parts && /^\/v1\/resource\/.+\.m4s$/i.test(parts[4])) {
+      // Another way the App fetches media (MCDN / PCDN nodes). Not accelerated yet — only counted,
+      // so that the status page shows how much of the traffic goes this way.
+      state = loadState();
+      change("bump", "otherMedia", 1);
+      change("set", "otherHost", parts[2].toLowerCase() + (parts[3] ? ":" + parts[3] : ""));
+      finish({});
+      return;
+    }
     if (!parts || !/^\/upgcxcode\/.+\.m4s$/i.test(parts[4])) { finished = true; $done({}); return; }
 
     state = loadState();
@@ -560,11 +620,15 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     change("recent", { p: pathKey, s: start, t: startedAt });
     currentKey = pathKey;
     currentStart = start;
+    currentAsked = bounded ? wantedEnd - start + 1 : 0;
     if (repeats) {
       change("bump", "dups", 1);
       // What did the App get the last time it asked for this very position? That tells whether the
       // repeats are retries after a slow answer, after a partial one, or after a failure.
       change("bump", !previous.o ? "dupPending" : previous.o === "short" ? "dupShort" : previous.o === "fail" || previous.o === "pass" ? "dupFail" : previous.ms > 2500 ? "dupSlow" : "dupQuick", 1);
+      // How long had the previous answer taken when the App asked again? The smallest such value
+      // is a hint of how long the App is prepared to wait.
+      if (previous.o === "ok" && previous.ms) { change("min", "dupAfterMinMs", previous.ms); change("max", "dupAfterMaxMs", previous.ms); }
     }
     if (bounded && wantedEnd - start + 1 > (state.stats.maxAsked || 0)) change("set", "maxAsked", wantedEnd - start + 1);
     change("head", pathKey, start, now);
@@ -590,6 +654,16 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var unknownHosts = pool.filter(function (host) { return speedOf(host) <= 0; }).sort(function (a, b) { return triesOf(a) - triesOf(b); });
     var assumedBps = knownHosts.length ? speedOf(knownHosts[Math.floor(knownHosts.length / 2)]) : BTRA_ASSUMED_BPS;
     var fresh = knownHosts.length < 3;
+    // Connections that another run (the other stream) is using right now still occupy the mirror:
+    // every run notes its connections under a shared key while it works and takes them out at the end.
+    var busy = {};
+    try { busy = JSON.parse($persistentStore.read(BTRA_BUSY_KEY) || "{}") || {}; } catch (_error) { busy = {}; }
+    function busyCount(host) {
+      var stamps = busy[host] || [];
+      var count = 0;
+      for (var b = 0; b < stamps.length; b += 1) if (stamps[b].r !== runId && now - stamps[b].t < BTRA_BUSY_MS) count += 1;
+      return count;
+    }
     var slots = [];
     if (fresh) {
       // Nothing much is known yet: everybody gets an even share, and the App's own pieces are asked
@@ -602,7 +676,8 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       }
     } else {
       for (var k = 0; k < knownHosts.length && slots.length < config.conns; k += 1) {
-        for (var c = 0; c < BTRA_PER_HOST && slots.length < config.conns; c += 1) slots.push({ host: knownHosts[k], bps: speedOf(knownHosts[k]), explore: false });
+        var room = Math.max(1, BTRA_PER_HOST - busyCount(knownHosts[k]));
+        for (var c = 0; c < room && slots.length < config.conns; c += 1) slots.push({ host: knownHosts[k], bps: speedOf(knownHosts[k]), explore: false });
       }
       // Exploration: up to two unmeasured mirrors get one slot each, in place of the slowest slots.
       for (var u = 0; u < unknownHosts.length && u < 2; u += 1) {
@@ -611,6 +686,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       }
     }
     var duplicateMust = fresh;
+    busyNote(slots.map(function (slot) { return slot.host; }));
     // A connection's slice: what its mirror should deliver in BTRA_SLICE_MS. Too slow for even the
     // smallest piece → 0, the connection sits this batch out.
     function slotBytes(slot) {
@@ -668,13 +744,16 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       return body;
     }
 
-    function respond(body, fromCacheBytes, pieceCount, elapsed) {
+    function respond(body, fromCacheBytes, pieceCount, elapsed, detail) {
       var isShort = end < wantedEnd;
       change("bump", "served", body.length);
       change("bump", "servedCached", fromCacheBytes);
       if (isShort) change("bump", "shortReplies", 1);
       if (elapsed > 4000) change("bump", "slowRuns", 1);
       change("rdone", pathKey, start, startedAt, isShort ? "short" : "ok", elapsed);
+      var record = { k: pieceCount ? (fromCacheBytes ? "part" : "miss") : "hit", a: currentAsked, s: body.length, ms: elapsed, sh: isShort ? 1 : 0 };
+      if (detail) { record.f = detail.fetched; record.m = detail.mustMs; record.p = pieceCount; record.c = detail.capacity; record.n = detail.slots; }
+      change("run", record);
       var headers = {
         "Content-Type": contentType || "video/mp4",
         "Content-Range": "bytes " + start + "-" + end + "/" + total,
@@ -712,6 +791,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     if (caching && config.aheadBytes && mustBytes >= 262144) {
       // Never more than half the cache in one go: the other stream (sound) needs room too.
       var ahead = Math.max(0, Math.min(config.aheadBytes, Math.round(config.cacheBytes / 2) - mustBytes));
+      if (total) ahead = Math.min(ahead, Math.max(1048576, Math.round(total / 8)));
       if (!total) ahead = Math.min(ahead, 1048576);
       var aheadEnd = total ? Math.min(total - 1, end + ahead) : end + ahead;
       if (aheadEnd > end) {
@@ -763,7 +843,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         var range = slots[si].explore ? null : take(mustQueue, slice);
         if (range) { addPiece(range, false, slots[si]); continue; }
         if (batchBytes >= BTRA_MAX_BATCH) break;
-        range = take(extraQueue, Math.min(slice, BTRA_MAX_BATCH - batchBytes));
+        range = take(extraQueue, Math.max(BTRA_MIN_SLOT, Math.min(Math.round(slice * BTRA_EXTRA_SHARE), BTRA_MAX_BATCH - batchBytes)));
         if (range) addPiece(range, true, slots[si]);
       }
     } else {
@@ -823,6 +903,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       change("bump", "failed", 1);
       change("set", "lastError", reason);
       change("rdone", pathKey, start, startedAt, "fail", Date.now() - startedAt);
+      change("run", { k: "fail", a: currentAsked, ms: Date.now() - startedAt, r: reason, f: fetchedBytes, p: pieces.length });
       var key = "origin:" + originHost;
       change("streak", key, 1);
       if ((state.streaks[key] || 0) >= 4) {
@@ -1061,10 +1142,10 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       if (extraLeft > 0) {
         if (typeof setTimeout !== "function") extraLeft = 0;
         else {
-          // Every piece was sized to take about BTRA_SLICE_MS, so the healthy read-ahead pieces are
-          // due by then (plus connection set-up); the answer is not held up beyond that.
+          // The read-ahead pieces were cut shorter than the App's, so the healthy ones are already
+          // here; a short wait for the rest, then the answer goes out.
           if (graceTimer === null) {
-            var grace = Math.max(250, launchedAt + BTRA_SLICE_MS + 600 - Date.now());
+            var grace = Math.max(150, Math.min(400, launchedAt + BTRA_SLICE_MS + 400 - Date.now()));
             graceTimer = setTimeout(function () { extraLeft = 0; settle(); }, grace);
           }
           return;
@@ -1088,14 +1169,14 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       if (state.streaks["origin:" + originHost]) change("streak", "origin:" + originHost, null);
       notifyOnce("working", 6 * 3600000, "BTR App 模式正在加速", config.conns + " 连接 · " + (config.overseas ? "海外 CDN" : "大陆 CDN"), "刚才这一批 " + sizeText(fetchedBytes) + " 用了 " + (batchMs / 1000).toFixed(1) + " 秒（" + pieces.length + " 个子块）。统计页：" + BTRA_STATUS_URL);
       storeFetched();
-      respond(body, cachedBytes, pieces.length, elapsed);
+      respond(body, cachedBytes, pieces.length, elapsed, { fetched: fetchedBytes, mustMs: mustDoneAt - startedAt, capacity: capacity, slots: slots.length });
     }
 
     if (typeof setTimeout === "function") {
       setTimeout(function () { giveUp("超过 " + Math.round(BTRA_DEADLINE / 1000) + " 秒还没拼齐"); }, BTRA_DEADLINE);
-      setTimeout(function () { hedge(true); }, 1200);
-      setTimeout(function () { hedge(true); }, 2000);
-      setTimeout(function () { hedge(true); }, 3200);
+      setTimeout(function () { hedge(true); }, Math.round(BTRA_SLICE_MS * 1.4));
+      setTimeout(function () { hedge(true); }, Math.round(BTRA_SLICE_MS * 2.2));
+      setTimeout(function () { hedge(true); }, Math.round(BTRA_SLICE_MS * 3.2));
     }
     pump();
     if (!mustLeft) settle();

@@ -7,7 +7,7 @@
 #!tag = 哔哩哔哩, 视频加速
 #!system = iOS, iPadOS
 #!date = 2026-09-18
-#!version = 1.2.0
+#!version = 1.3.0
 
 [Argument]
 conns = select,"32","16","64","8",tag=并发连接数,desc=每一批同时开几条连接。到大陆节点的单条连接很慢（每条几十 KB/s），靠的是数量；快的节点会分到更多、更大的块。发热明显就调到 16
@@ -35,6 +35,7 @@ AND,((DOMAIN,m.bilibili.com),(PROTOCOL,QUIC)),REJECT
 
 [Script]
 http-request ^https?:\/\/[^\/]+\/upgcxcode\/.+\.m4s script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式, timeout=30, argument=[{conns},{ahead},{cache},{cdn},{openEnded},{notify}]
+http-request ^https?:\/\/[^\/]+(?::\d+)?\/v1\/resource\/.+\.m4s script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式（其他取流方式，仅统计）, timeout=10, argument=[{conns},{ahead},{cache},{cdn},{openEnded},{notify}]
 http-request ^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__ script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式统计页, timeout=10, argument=[{conns},{ahead},{cache},{cdn},{openEnded},{notify}]
 
 [MITM]
