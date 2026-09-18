@@ -1,0 +1,19 @@
+#!name = BTR 探针（官方 App 取流方式诊断）
+#!desc = 只做诊断：记录哔哩哔哩官方 App 请求视频分段时的 Range 写法，每 25 个请求发一条通知，所有请求原样放行。看完通知就请关掉这个插件（它要对视频 CDN 做 MITM，比较耗电）。
+#!author = BTR-iOS
+#!homepage = __BTRI_HOMEPAGE__
+#!icon = __BTRI_ICON_URL__
+#!tag = 哔哩哔哩, 诊断
+#!system = iOS, iPadOS
+#!date = __BTRI_DATE__
+#!version = __BTRI_VERSION__
+
+[General]
+# 官方 App 有一部分取流走明文 HTTP 和非标准端口，让这些也经过 Loon 的 HTTP 引擎才能看到请求头
+force-http-engine-hosts = upos-sz-mirror*.bilivideo.com:80, cn-hk-eq-*.bilivideo.com:80, upos-*-mirrorakam.akamaized.net:80, *:4480, *:4483, *:8000, *:8082, *:9102
+
+[Script]
+http-request ^https?:\/\/[^\/]+\/(?:upgcxcode|v1\/resource)\/.+\.m4s script-path=__BTRI_PROBE_URL__, tag=BTR 探针, timeout=5
+
+[MITM]
+hostname = *.mcdn.bilivideo.cn, upos-sz-mirror*.bilivideo.com, cn-hk-eq-*.bilivideo.com, upos-*-mirrorakam.akamaized.net

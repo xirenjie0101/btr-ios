@@ -1,0 +1,32 @@
+#!name = BTR-iOS 线程撕裂者
+#!desc = 在 Safari 里用多线程 + 多 CDN 并发下载播放 B 站视频，缓解海外看冷门、高码率视频的卡顿。用法：Safari 打开 https://www.bilibili.com/__btr__/ （可添加到主屏幕）。移植自开源项目 Bilibili-thread-ripper，非官方。
+#!author = BTR-iOS
+#!homepage = https://github.com/xirenjie0101/btr-ios
+#!icon = https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/icon.png
+#!openUrl = https://www.bilibili.com/__btr__/
+#!tag = 哔哩哔哩, 视频加速
+#!system = iOS, iPadOS, macOS
+#!date = 2026-09-18
+#!version = 1.0.0
+
+[Argument]
+injectButton = switch,true,tag=视频页悬浮按钮,desc=在 Safari 里打开 B 站视频页时，右下角显示“⚡ BTR 加速播放”按钮
+autoRedirect = switch,false,tag=视频页自动跳转,desc=在 Safari 里打开 B 站视频页时，直接跳到 BTR 播放器（不想跳转的链接加上 ?btr=0）
+
+[Rule]
+# MITM 只能处理 TCP 上的 HTTPS。让这两个域名不走 QUIC（HTTP/3），否则页面和按钮可能加不上。
+AND,((DOMAIN,www.bilibili.com),(PROTOCOL,QUIC)),REJECT
+AND,((DOMAIN,m.bilibili.com),(PROTOCOL,QUIC)),REJECT
+# 视频数据最好直连（不要绕道代理节点）。如果你的配置会把 B 站 CDN 分流到代理，把下面几行开头的 # 去掉：
+# DOMAIN-SUFFIX,bilivideo.com,DIRECT
+# DOMAIN-SUFFIX,bilivideo.cn,DIRECT
+# DOMAIN,upos-hz-mirrorakam.akamaized.net,DIRECT
+# DOMAIN,upos-sz-mirrorakam.akamaized.net,DIRECT
+
+[Script]
+http-request ^https?:\/\/(?:www|m)\.bilibili\.com\/__btr__\/ script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-loon.js, tag=BTR-iOS 播放器页面, timeout=20
+http-request ^https?:\/\/(?:m|www)\.bilibili\.com\/video\/(?:BV[0-9A-Za-z]+|av\d+) script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-loon.js, tag=BTR-iOS 视频页自动跳转, timeout=10, enable={autoRedirect}
+http-response ^https?:\/\/(?:m|www)\.bilibili\.com\/video\/(?:BV[0-9A-Za-z]+|av\d+) script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-loon.js, requires-body=true, timeout=20, tag=BTR-iOS 视频页悬浮按钮, enable={injectButton}
+
+[MITM]
+hostname = www.bilibili.com, m.bilibili.com

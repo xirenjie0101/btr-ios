@@ -1,0 +1,37 @@
+#!name = BTR-iOS App 模式（线程撕裂者）
+#!desc = 让哔哩哔哩 App（国内版/国际版）取视频时多线程、多 CDN 并发下载，缓解海外看冷门、高码率视频卡顿。出错或不适用时自动原样放行。统计页：Safari 打开 https://www.bilibili.com/__btr_app__/ 。思路来自开源项目 Bilibili-thread-ripper，非官方。若同时装了 BiliUniverse Redirect 等改 B 站 CDN 的插件，请先关掉它们。
+#!author = BTR-iOS
+#!homepage = __BTRI_HOMEPAGE__
+#!icon = __BTRI_ICON_URL__
+#!openUrl = https://www.bilibili.com/__btr_app__/
+#!tag = 哔哩哔哩, 视频加速
+#!system = iOS, iPadOS
+#!date = __BTRI_DATE__
+#!version = __BTRI_VERSION__
+
+[Argument]
+threads = select,"8","4","16","32",tag=并发线程,desc=每次取流同时开几条连接。先用 8，缓冲跟不上再试 16；不是越多越快
+chunk = select,"2MB","1MB","4MB",tag=每次答复的块大小,desc=App 发“一直读到底”的请求时，每次先答复这么多。块越大越省往返，但每块要等更久、也更吃内存
+cdn = select,"大陆CDN","海外CDN",tag=CDN 模式,desc=海外看冷门视频选大陆 CDN（配合多线程）；到大陆线路特别差再试海外 CDN
+openEnded = select,"分块答复","原样放行",tag=大范围取流请求,desc=分块答复才能加速“一直读到底”的请求；如果开着插件 App 放不了视频，改成原样放行
+notify = switch,true,tag=通知,desc=开始加速、保险丝跳闸时发一条通知
+
+[General]
+# App 的一部分取流走明文 HTTP 和非标准端口，让它们也经过 HTTP 引擎，脚本才看得到
+force-http-engine-hosts = upos-sz-mirror*.bilivideo.com:80, cn-hk-eq-*.bilivideo.com:80, upos-*-mirrorakam.akamaized.net:80, *:4480, *:4483, *:8000, *:8082, *:9102
+
+[Rule]
+# MITM 只看得到 TCP 上的请求；不让视频 CDN 走 QUIC，App 会自动退回 HTTPS
+AND,((DOMAIN-SUFFIX,bilivideo.com),(PROTOCOL,QUIC)),REJECT
+AND,((DOMAIN-SUFFIX,bilivideo.cn),(PROTOCOL,QUIC)),REJECT
+AND,((DOMAIN-KEYWORD,mirrorakam),(PROTOCOL,QUIC)),REJECT
+# 视频数据最好直连。如果你的配置会把 B 站 CDN 分流到代理节点，把下面两行开头的 # 去掉：
+# DOMAIN-SUFFIX,bilivideo.com,DIRECT
+# DOMAIN-SUFFIX,bilivideo.cn,DIRECT
+
+[Script]
+http-request ^https?:\/\/[^\/]+\/upgcxcode\/.+\.m4s script-path=__BTRI_APP_SCRIPT_URL__, tag=BTR App 模式, timeout=30, argument=[{threads},{chunk},{cdn},{openEnded},{notify}]
+http-request ^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__ script-path=__BTRI_APP_SCRIPT_URL__, tag=BTR App 模式统计页, timeout=10, argument=[{threads},{chunk},{cdn},{openEnded},{notify}]
+
+[MITM]
+hostname = upos-*.bilivideo.com, cn-hk-eq-*.bilivideo.com, *.mcdn.bilivideo.cn, upos-*-mirrorakam.akamaized.net, www.bilibili.com
