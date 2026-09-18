@@ -1,5 +1,5 @@
 /*
- * BTR-iOS · App 模式  —  1.1.0
+ * BTR-iOS · App 模式  —  1.2.0
  *
  * 让哔哩哔哩 App（国内版 / 国际版）取视频数据时也用上“线程撕裂者”的办法：向多个 CDN 节点并行要
  * 字节块，拼好后交还给 App 的播放器。思路来自开源项目 Bilibili-thread-ripper（MIT）。
@@ -21,11 +21,10 @@
  * 只读请求头、只搬运视频字节；不读取也不保存账号、Cookie 或播放记录，不向任何第三方发数据。
  * Generated file — edit src/ and run `node build.js` instead.
  */
-var BTRA_VERSION = "1.1.0";
+var BTRA_VERSION = "1.2.0";
 var BTRA_STORE_KEY = "btr_ios_app_v2";
 var BTRA_CACHE_PREFIX = "btr_ios_app_c:";
 var BTRA_STATUS_URL = "https://www.bilibili.com/__btr_app__/";
-var BTRA_SPAWN_URL = "https://www.bilibili.com/__btr_app__/spawn";
 var BTRA_MAINLAND = [
   "upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com",
   "upos-sz-mirror08c.bilivideo.com", "upos-sz-mirrorbd.bilivideo.com", "upos-sz-mirror14b.bilivideo.com",
@@ -35,13 +34,18 @@ var BTRA_OVERSEAS = [
   "upos-sz-mirrorcosov.bilivideo.com", "upos-sz-mirroraliov.bilivideo.com",
   "cn-hk-eq-01-01.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com"
 ];
-var BTRA_MIN_PIECE = 128 * 1024;
-var BTRA_MAX_PIECE = 1024 * 1024;
+var BTRA_SLICE_MS = 1500;             // every connection is given what it should deliver in this time
+var BTRA_ASSUMED_BPS = 40;             // bytes per ms assumed for a mirror nobody has measured (≈ 40 KB/s)
+var BTRA_PER_HOST = 6;                 // connections to one mirror at a time (iOS queues more than that)
+var BTRA_MIN_SLOT = 32 * 1024;
+var BTRA_MAX_PIECE = 512 * 1024;
+var BTRA_MAX_BATCH = 8 * 1024 * 1024;
 var BTRA_MAX_REPLY = 8 * 1024 * 1024;
 var BTRA_EXACT_LIMIT = 4 * 1024 * 1024;
 var BTRA_OPEN_REPLY = 2 * 1024 * 1024;
-var BTRA_DEADLINE = 14000;
-var BTRA_BATCH_TARGET_MS = 2500;
+var BTRA_PIECE_TIMEOUT = 9000;
+var BTRA_HEDGE_BUDGET = 4;
+var BTRA_DEADLINE = 8000;
 var BTRA_CACHE_TTL = 10 * 60000;
 var BTRA_BEHIND_KEEP = 512 * 1024;
 
@@ -82,11 +86,11 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         if (pair[0]) map[pair[0]] = pair.slice(1).join("=");
       }
     }
-    var threads = parseInt(map.threads, 10);
+    var conns = parseInt(map.conns !== undefined ? map.conns : map.threads, 10);
     return {
-      threads: threads >= 1 && threads <= 64 ? threads : 32,
+      conns: conns >= 1 && conns <= 64 ? conns : 32,
       aheadBytes: megabytes(map.ahead, 4, true),
-      cacheBytes: megabytes(map.cache, 8, true),
+      cacheBytes: megabytes(map.cache, 16, true),
       overseas: /海外|overseas/i.test(String(map.cdn || "")),
       chunkReplies: !/放行|pass/i.test(String(map.openEnded || "")),
       notify: !(map.notify === false || map.notify === "false" || map.notify === 0 || map.notify === "0")
@@ -206,7 +210,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
   }
 
   function hostRecord(state, host) {
-    return state.hosts[host] || (state.hosts[host] = { ok: 0, bad: 0, streak: 0, until: 0, benches: 0, bps: 0 });
+    return state.hosts[host] || (state.hosts[host] = { ok: 0, bad: 0, late: 0, streak: 0, lateStreak: 0, until: 0, benches: 0, bps: 0 });
   }
 
   function apply(state, op) {
@@ -217,6 +221,19 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     else if (kind === "rr") state.rr = ((state.rr || 0) + 1) % 1000000;
     else if (kind === "total") state.totals[op[1]] = { size: op[2], t: op[3], type: op[4] || "" };
     else if (kind === "recent") state.recent.push(op[1]);
+    else if (kind === "rdone") {
+      for (var recentIndex = state.recent.length - 1; recentIndex >= 0; recentIndex -= 1) {
+        var seenEntry = state.recent[recentIndex];
+        if (seenEntry.p === op[1] && seenEntry.s === op[2] && seenEntry.t === op[3]) { seenEntry.o = op[4]; seenEntry.ms = op[5]; break; }
+      }
+    }
+    else if (kind === "late") {
+      var lateHost = hostRecord(state, op[1]);
+      lateHost.late = (lateHost.late || 0) + 1;
+      lateHost.lateStreak = (lateHost.lateStreak || 0) + 1;
+      if (lateHost.bps) lateHost.bps *= 0.75;
+      if (lateHost.lateStreak >= 3 && !(lateHost.until > op[2])) { lateHost.lateStreak = 0; lateHost.until = op[2] + 5 * 60000; }
+    }
     else if (kind === "breaker") state.breaker[op[1]] = op[2];
     else if (kind === "streak") state.streaks[op[1]] = op[2] === null ? 0 : (state.streaks[op[1]] || 0) + op[2];
     else if (kind === "note") state.notes[op[1]] = op[2];
@@ -227,7 +244,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     else if (kind === "host") {
       var item = hostRecord(state, op[1]);
       if (op[2]) {
-        item.ok += 1; item.streak = 0; item.until = 0; item.benches = 0;
+        item.ok += 1; item.streak = 0; item.lateStreak = 0; item.until = 0; item.benches = 0;
         if (op[4] > 0) item.bps = item.bps ? item.bps * 0.7 + op[4] * 0.3 : op[4];
       } else {
         item.bad += 1;
@@ -305,9 +322,13 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     $done(result);
   }
 
+  var currentKey = null;
+  var currentStart = 0;
+
   function passThrough(reason) {
     change("bump", "passed", 1);
     if (reason) change("set", "lastPass", reason);
+    if (currentKey !== null) change("rdone", currentKey, currentStart, startedAt, "pass", Date.now() - startedAt);
     finish({});
   }
 
@@ -317,15 +338,6 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     if (state.notes[key] && now - state.notes[key] < everyMs) return;
     change("note", key, now);
     try { $notification.post(title, subtitle, body); } catch (_error) {}
-  }
-
-  // Direct counters for things that happen after this run has already answered (the experiments).
-  function bumpDirect(key) {
-    try {
-      var fresh = loadState();
-      fresh.stats[key] = (fresh.stats[key] || 0) + 1;
-      $persistentStore.write(JSON.stringify(fresh), BTRA_STORE_KEY);
-    } catch (_error) {}
   }
 
   /* ------------------------------------------------------------ cache entries */
@@ -449,7 +461,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var hosts = [];
     for (var host in current.hosts) {
       var item = current.hosts[host];
-      hosts.push(escapeHtml(shortHost(host) + "：成功 " + (item.ok || 0) + " / 失败 " + (item.bad || 0) + (item.bps ? " · " + Math.round(item.bps * 1000 / 1024) + " KB/s" : "") + (item.until > now ? "（停用中）" : "")));
+      hosts.push(escapeHtml(shortHost(host) + "：成功 " + (item.ok || 0) + " / 失败 " + (item.bad || 0) + " / 迟到 " + (item.late || 0) + (item.bps ? " · " + Math.round(item.bps * 1000 / 1024) + " KB/s" : "") + (item.until > now ? "（停用中）" : "")));
     }
     var cached = 0;
     for (var c = 0; c < current.cache.length; c += 1) cached += current.cache[c].b;
@@ -460,13 +472,14 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var hist = "≤256K " + (stats.h256 || 0) + " · ≤1M " + (stats.h1m || 0) + " · ≤2M " + (stats.h2m || 0) + " · ≤4M " + (stats.h4m || 0) + " · >4M " + (stats.hbig || 0);
     var rows = [
       ["版本", escapeHtml(BTRA_VERSION)],
-      ["设置", escapeHtml(config.threads + " 线程 · 预读 " + (config.aheadBytes ? sizeText(config.aheadBytes) : "关") + " · 缓存上限 " + (config.cacheBytes ? sizeText(config.cacheBytes) : "关") + " · " + (config.overseas ? "海外 CDN" : "大陆 CDN") + " · 大范围请求：" + (config.chunkReplies ? "分块答复" : "原样放行"))],
+      ["设置", escapeHtml(config.conns + " 条连接 · 预读 " + (config.aheadBytes ? sizeText(config.aheadBytes) : "关") + " · 缓存上限 " + (config.cacheBytes ? sizeText(config.cacheBytes) : "关") + " · " + (config.overseas ? "海外 CDN" : "大陆 CDN") + " · 大范围请求：" + (config.chunkReplies ? "分块答复" : "原样放行"))],
       ["统计起点", escapeHtml(new Date(current.since).toLocaleString())],
       ["看到的取流请求", escapeHtml((stats.seen || 0) + " 个（小段 " + (stats.bounded || 0) + " · 开放式 " + (stats.open || 0) + " · 无 Range " + (stats.none || 0) + " · 其他 " + (stats.other || 0) + "）")],
-      ["请求大小分布", escapeHtml(hist + " · 重复位置 " + (stats.dups || 0))],
+      ["请求大小分布", escapeHtml(hist + " · 最大 " + sizeText(stats.maxAsked || 0))],
+      ["重复位置", escapeHtml((stats.dups || 0) + " 次：上一次答复还没完成 " + (stats.dupPending || 0) + " · 上次答得慢 " + (stats.dupSlow || 0) + " · 上次答得快 " + (stats.dupQuick || 0) + " · 上次是分块答复 " + (stats.dupShort || 0) + " · 上次放行/失败 " + (stats.dupFail || 0))],
       ["缓存命中", escapeHtml(hits + " 次（平均 " + average(stats.hitMs, hits) + " ms）· 部分命中 " + (stats.partial || 0) + " 次 · 未命中 " + misses + " 次")],
-      ["未命中耗时", escapeHtml("平均：准备 " + average(stats.prepMs, misses) + " ms · App 要的部分到手 " + average(stats.mustMs, misses) + " ms · 整批到手 " + average(stats.allMs, misses) + " ms")],
-      ["多线程取回", escapeHtml((stats.batches || 0) + " 批 · " + sizeText(stats.fetched || 0) + " · " + (stats.pieces || 0) + " 个子块 · 平均 " + (stats.bps ? Math.round(stats.bps * 1000 / 1024) : 0) + " KB/s（每批）")],
+      ["未命中耗时", escapeHtml("平均：准备 " + average(stats.prepMs, stats.batches) + " ms · App 要的部分到手 " + average(stats.mustMs, stats.batches) + " ms · 整批到手 " + average(stats.allMs, stats.batches) + " ms · 超过 4 秒的答复 " + (stats.slowRuns || 0) + " 次")],
+      ["多线程取回", escapeHtml((stats.batches || 0) + " 批 · " + sizeText(stats.fetched || 0) + " · " + (stats.pieces || 0) + " 个子块 · 平均 " + (stats.bps ? Math.round(stats.bps * 1000 / 1024) : 0) + " KB/s（每批）· 上一批容量 " + sizeText(stats.lastCapacity || 0) + " / " + (BTRA_SLICE_MS / 1000) + " 秒")],
       ["交给 App", escapeHtml(sizeText(stats.served || 0) + "，其中来自缓存 " + sizeText(stats.servedCached || 0) + " · 分块答复 " + (stats.shortReplies || 0) + " 次")],
       ["缓存", escapeHtml(current.cache.length + " 条 · " + sizeText(cached) + " / 上限 " + (config.cacheBytes ? sizeText(config.cacheBytes) : "关") + (current.flags.cacheOff ? " · 已停用：" + current.flags.cacheOff : ""))],
       ["存储自检", escapeHtml(testText)],
@@ -474,7 +487,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       ["失败后放行", escapeHtml((stats.failed || 0) + " 次" + (stats.lastError ? "（最近一次：" + stats.lastError + "）" : ""))],
       ["保险丝", breakers.length ? breakers.join("<br>") : "没有跳闸"],
       ["节点", hosts.length ? hosts.join("<br>") : "还没有记录"],
-      ["实验（给作者看）", escapeHtml("$done 之后：发出 " + (stats.e1sent || 0) + " · 定时器仍触发 " + (stats.e1timer || 0) + " · 网络回调仍触发 " + (stats.e1http || 0) + " · 迟到的预读块补存 " + (stats.late || 0) + "；自派生运行：发出 " + (stats.e2sent || 0) + " · 收到 " + (stats.e2seen || 0) + " · 3 秒后仍在 " + (stats.e2alive || 0))],
+      ["答复之后才到的块", escapeHtml((stats.late || 0) + " 块补存进了缓存（Loon 通常在答复后立刻结束脚本，所以这个数一般是 0）")],
       ["App 标识", escapeHtml(stats.agent || "还没有记录")]
     ];
     var html = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
@@ -487,21 +500,9 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     $done({ response: { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }, body: html } });
   }
 
-  // Experiment 2: a request this script sent to itself. Counted at once, and again 3 s later if
-  // the run is still alive by then.
-  function spawnProbe() {
-    state = loadState();
-    change("bump", "e2seen", 1);
-    commit();
-    var reply = { response: { status: 204, headers: { "Cache-Control": "no-store" }, body: "" } };
-    if (typeof setTimeout !== "function") { finish(reply); return; }
-    setTimeout(function () { change("bump", "e2alive", 1); finish(reply); }, 3000);
-  }
-
   /* ------------------------------------------------------------ main */
 
   function main() {
-    if (/^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__\/spawn(?:[/?#]|$)/i.test(url)) { spawnProbe(); return; }
     if (/^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__(?:[/?#]|$)/i.test(url)) { statusPage(); return; }
 
     var method = String(request.method || "GET").toUpperCase();
@@ -551,25 +552,84 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     // The same position asked for again within a minute: a retry after a timeout on the App's side,
     // or a player that does not carry on after a short answer.
     var repeats = 0;
+    var previous = null;
     for (var index = 0; index < state.recent.length; index += 1) {
       var entry = state.recent[index];
-      if (now - entry.t <= 60000 && entry.p === pathKey && entry.s === start) repeats += 1;
+      if (now - entry.t <= 60000 && entry.p === pathKey && entry.s === start) { repeats += 1; previous = entry; }
     }
-    change("recent", { p: pathKey, s: start, t: now });
-    if (repeats) change("bump", "dups", 1);
+    change("recent", { p: pathKey, s: start, t: startedAt });
+    currentKey = pathKey;
+    currentStart = start;
+    if (repeats) {
+      change("bump", "dups", 1);
+      // What did the App get the last time it asked for this very position? That tells whether the
+      // repeats are retries after a slow answer, after a partial one, or after a failure.
+      change("bump", !previous.o ? "dupPending" : previous.o === "short" ? "dupShort" : previous.o === "fail" || previous.o === "pass" ? "dupFail" : previous.ms > 2500 ? "dupSlow" : "dupQuick", 1);
+    }
+    if (bounded && wantedEnd - start + 1 > (state.stats.maxAsked || 0)) change("set", "maxAsked", wantedEnd - start + 1);
     change("head", pathKey, start, now);
 
     var caching = config.cacheBytes > 0 && !state.flags.cacheOff;
     if (caching) storeSelfTest();
     caching = caching && !state.flags.cacheOff;
 
+    /* ---- mirrors: who gets how much ----
+     * Mirrors differ twentyfold in what one connection delivers (a phone in Los Angeles measured
+     * 12 KB/s on one, 269 KB/s on another). Sharing pieces out evenly would make every batch wait
+     * for the slowest. Instead every connection ("slot") gets as many bytes as its mirror is
+     * expected to deliver in BTRA_BATCH_TARGET_MS, so the whole batch lands at about the same
+     * moment, and the fast mirrors carry most of it. Mirrors nobody has measured get one small
+     * read-ahead piece now and then, which is how they become known.
+     */
+    var everyMirror = config.overseas ? BTRA_OVERSEAS : BTRA_MAINLAND;
+    var pool = everyMirror.filter(function (host) { return !(state.hosts[host] && state.hosts[host].until > now); });
+    if (pool.length < 2) pool = everyMirror.slice();
+    var speedOf = function (host) { var record = state.hosts[host]; return record && record.bps > 0 ? record.bps : 0; };
+    var triesOf = function (host) { var record = state.hosts[host]; return record ? (record.ok || 0) + (record.bad || 0) + (record.late || 0) : 0; };
+    var knownHosts = pool.filter(function (host) { return speedOf(host) > 0; }).sort(function (a, b) { return speedOf(b) - speedOf(a); });
+    var unknownHosts = pool.filter(function (host) { return speedOf(host) <= 0; }).sort(function (a, b) { return triesOf(a) - triesOf(b); });
+    var assumedBps = knownHosts.length ? speedOf(knownHosts[Math.floor(knownHosts.length / 2)]) : BTRA_ASSUMED_BPS;
+    var fresh = knownHosts.length < 3;
+    var slots = [];
+    if (fresh) {
+      // Nothing much is known yet: everybody gets an even share, and the App's own pieces are asked
+      // of two mirrors at once (see duplicateMust) so that a dead one costs nothing but bandwidth.
+      // Half the connections, then, so that the doubled requests still fit into one round.
+      var order = knownHosts.concat(unknownHosts);
+      for (var s = 0; slots.length < Math.max(2, Math.floor(config.conns / 2)) && order.length; s += 1) {
+        var candidate = order[s % order.length];
+        slots.push({ host: candidate, bps: speedOf(candidate) || assumedBps, explore: false });
+      }
+    } else {
+      for (var k = 0; k < knownHosts.length && slots.length < config.conns; k += 1) {
+        for (var c = 0; c < BTRA_PER_HOST && slots.length < config.conns; c += 1) slots.push({ host: knownHosts[k], bps: speedOf(knownHosts[k]), explore: false });
+      }
+      // Exploration: up to two unmeasured mirrors get one slot each, in place of the slowest slots.
+      for (var u = 0; u < unknownHosts.length && u < 2; u += 1) {
+        if (slots.length >= config.conns) slots.pop();
+        slots.push({ host: unknownHosts[u], bps: Math.min(assumedBps, BTRA_ASSUMED_BPS), explore: true });
+      }
+    }
+    var duplicateMust = fresh;
+    // A connection's slice: what its mirror should deliver in BTRA_SLICE_MS. Too slow for even the
+    // smallest piece → 0, the connection sits this batch out.
+    function slotBytes(slot) {
+      var bytes = Math.min(BTRA_MAX_PIECE, Math.round(slot.bps * BTRA_SLICE_MS));
+      return bytes >= BTRA_MIN_SLOT ? bytes : 0;
+    }
+    // What one batch can carry (used to size answers to open-ended requests).
+    var capacity = 0;
+    for (var cs = 0; cs < slots.length; cs += 1) if (!slots[cs].explore) capacity += slotBytes(slots[cs]);
+    if (duplicateMust) capacity = Math.round(capacity / 2);
+
     // How much goes into this one answer. A range the App spelled out is answered exactly as long as
-    // it fits in memory comfortably. "From here to the end" (or a huge range) gets one block — more
-    // when the cache already holds the continuation, so the player needs fewer reconnects.
+    // it fits in memory comfortably. "From here to the end" (or a huge range) gets what one batch can
+    // carry — more when the cache already holds the continuation, so the player needs fewer
+    // reconnects.
     var end = wantedEnd;
     var plannedShort = false;
     if (!bounded || wantedEnd - start + 1 > BTRA_EXACT_LIMIT) {
-      var replyBytes = start === 0 ? Math.min(BTRA_OPEN_REPLY, 1048576) : BTRA_OPEN_REPLY;
+      var replyBytes = Math.max(start === 0 ? 1048576 : BTRA_OPEN_REPLY, Math.min(BTRA_MAX_REPLY, capacity));
       if (caching) replyBytes = Math.max(replyBytes, Math.min(BTRA_MAX_REPLY, contiguousCachedEnd(pathKey, start) - start + 1));
       end = Math.min(wantedEnd, start + replyBytes - 1);
       plannedShort = end < wantedEnd;
@@ -596,25 +656,6 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     for (var m = 0; m < must.length; m += 1) {
       if (must[m].entry) cachedBytes += must[m].e - must[m].s + 1; else missing.push(must[m]);
     }
-    var extras = [];
-    var mustBytes = 0;
-    for (var mb = 0; mb < missing.length; mb += 1) mustBytes += missing[mb].e - missing[mb].s + 1;
-    // A small request (the player probing a file header, or a small gap in the cache) is answered
-    // quickly on its own; the read-ahead comes with the next real block.
-    if (caching && config.aheadBytes && missing.length && mustBytes >= 524288) {
-      // At least one full wave of the smallest pieces, so that every thread has something to do;
-      // more when the batches seen so far were quick (about BTRA_BATCH_TARGET_MS per batch). A file
-      // whose length is still unknown gets a modest first batch.
-      var minBatch = config.threads * BTRA_MIN_PIECE;
-      var target = state.stats.bps ? Math.round(state.stats.bps * BTRA_BATCH_TARGET_MS) : minBatch;
-      var ahead = Math.max(0, Math.min(config.aheadBytes, Math.max(minBatch, target) - mustBytes));
-      if (!total) ahead = Math.min(ahead, 1048576);
-      var aheadEnd = total ? Math.min(total - 1, end + ahead) : end + ahead;
-      if (aheadEnd > end) {
-        var region = coverage(pathKey, end + 1, aheadEnd, false);
-        for (var r = 0; r < region.length; r += 1) if (!region[r].entry) extras.push(region[r]);
-      }
-    }
 
     function assemble() {
       var length = end - start + 1;
@@ -632,12 +673,14 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       change("bump", "served", body.length);
       change("bump", "servedCached", fromCacheBytes);
       if (isShort) change("bump", "shortReplies", 1);
+      if (elapsed > 4000) change("bump", "slowRuns", 1);
+      change("rdone", pathKey, start, startedAt, isShort ? "short" : "ok", elapsed);
       var headers = {
         "Content-Type": contentType || "video/mp4",
         "Content-Range": "bytes " + start + "-" + end + "/" + total,
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-store",
-        "X-BTR-iOS": BTRA_VERSION + "; pieces=" + pieceCount + "; cached=" + fromCacheBytes + "; ms=" + elapsed
+        "X-BTR-iOS": BTRA_VERSION + "; pieces=" + pieceCount + "; cached=" + fromCacheBytes + "; ms=" + elapsed + "; capacity=" + capacity
       };
       // After a short answer the player has to come back for the rest. On a kept-alive HTTP/1.1
       // connection some players would wait for more bytes instead; closing makes the end explicit.
@@ -661,26 +704,21 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     }
     change("bump", cachedBytes ? "partial" : "misses", 1);
 
-    /* ---- mirrors ---- */
-    var everyMirror = config.overseas ? BTRA_OVERSEAS : BTRA_MAINLAND;
-    var pool = everyMirror.filter(function (host) { return !(state.hosts[host] && state.hosts[host].until > now); });
-    if (pool.length < 2) pool = everyMirror.slice();
-    // Proven fast mirrors first; the ones nobody has measured yet are tried in between.
-    var speedOf = function (host) { var record = state.hosts[host]; return record && record.bps ? record.bps : -1; };
-    var known_ = pool.filter(function (host) { return speedOf(host) > 0; }).sort(function (a, b) { return speedOf(b) - speedOf(a); });
-    var unknown = pool.filter(function (host) { return speedOf(host) <= 0; });
-    var ranked = [];
-    for (var ki = 0, ui = 0; ki < known_.length || ui < unknown.length;) {
-      if (ki < known_.length) ranked.push(known_[ki++]);
-      if (ki < known_.length) ranked.push(known_[ki++]);
-      if (ui < unknown.length) ranked.push(unknown[ui++]);
+    var mustBytes = 0;
+    for (var mb = 0; mb < missing.length; mb += 1) mustBytes += missing[mb].e - missing[mb].s + 1;
+    // A small request (the player probing a file header, or a small gap in the cache) is answered
+    // quickly on its own; the read-ahead comes with the next real block.
+    var extras = [];
+    if (caching && config.aheadBytes && mustBytes >= 262144) {
+      // Never more than half the cache in one go: the other stream (sound) needs room too.
+      var ahead = Math.max(0, Math.min(config.aheadBytes, Math.round(config.cacheBytes / 2) - mustBytes));
+      if (!total) ahead = Math.min(ahead, 1048576);
+      var aheadEnd = total ? Math.min(total - 1, end + ahead) : end + ahead;
+      if (aheadEnd > end) {
+        var region = coverage(pathKey, end + 1, aheadEnd, false);
+        for (var r = 0; r < region.length; r += 1) if (!region[r].entry) extras.push({ s: region[r].s, e: region[r].e });
+      }
     }
-    var activeCount = Math.min(ranked.length, Math.max(4, Math.ceil(config.threads / 4)));
-    // The batch goes to mirrors that have already proved themselves (the fastest few) whenever
-    // enough of them are known; until then, to the first few of the list. Mirrors nobody has
-    // measured yet only ever get the occasional read-ahead piece (see pickHost).
-    var trusted = known_.length >= 3 ? known_.slice(0, Math.max(activeCount, 3)) : ranked.slice(0, activeCount);
-    var rotation = state.rr || 0;
     // Akamai's own token means nothing to the ordinary mirrors.
     var mirrorQuery = query.replace(/([?&])hdnts=[^&]*(&|$)/, function (_all, lead, tail) { return tail ? lead : ""; });
 
@@ -693,38 +731,60 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     forwardHeaders["X-BTR-Sub"] = "1";
     forwardHeaders["Accept-Encoding"] = "identity";
 
-    /* ---- pieces ---- */
-    var extraBytes = 0;
-    for (var ee = 0; ee < extras.length; ee += 1) extraBytes += extras[ee].e - extras[ee].s + 1;
-    // A batch without read-ahead (a probe, a small gap) and the first batch of a file (length unknown,
-    // the player waiting for the header) are cut finer so that they land sooner; ordinary batches use
-    // bigger pieces, which cost less per byte to set up.
-    var minPiece = !extras.length ? BTRA_MIN_PIECE / 4 : total ? BTRA_MIN_PIECE : BTRA_MIN_PIECE / 2;
-    var pieceSize = Math.max(minPiece, Math.min(BTRA_MAX_PIECE, Math.ceil((mustBytes + extraBytes) / config.threads)));
-    // Until a few mirrors have proved themselves, the App's own pieces are asked of two mirrors at
-    // once (the first good answer wins): a dead mirror then costs nothing but bandwidth.
-    var duplicateMust = known_.length < 3;
+    /* ---- pieces ----
+     * One round: every connection gets one piece, its slice, so the whole batch lands at about the
+     * same moment (BTRA_SLICE_MS plus connection set-up). The App's bytes are handed to the fastest
+     * connections first, the read-ahead to the rest. A batch without read-ahead (a probe, a small
+     * gap, the App's bytes on their own) is cut finer instead: every measured connection takes a
+     * share in proportion to its speed, which is the quickest way to get those bytes here.
+     */
     var pieces = [];
-    function cut(segments, extra) {
-      // Each segment is divided evenly, so there are no tiny leftover pieces.
-      for (var index = 0; index < segments.length; index += 1) {
-        var bytes = segments[index].e - segments[index].s + 1;
-        var count = Math.max(1, Math.ceil(bytes / pieceSize));
-        var cursor = segments[index].s;
-        for (var n = 0; n < count; n += 1) {
-          var pieceEnd = n === count - 1 ? segments[index].e : cursor + Math.floor(bytes / count) + (n < bytes % count ? 1 : 0) - 1;
-          pieces.push({ index: pieces.length, start: cursor, end: pieceEnd, extra: extra });
-          cursor = pieceEnd + 1;
-        }
+    var batchBytes = 0;
+    var mustQueue = missing.map(function (segment) { return { s: segment.s, e: segment.e }; });
+    var extraQueue = extras;
+    function take(queue, bytes) {
+      if (!queue.length) return null;
+      var segment = queue[0];
+      var pieceEnd = Math.min(segment.e, segment.s + bytes - 1);
+      var range = { start: segment.s, end: pieceEnd };
+      if (pieceEnd === segment.e) queue.shift(); else segment.s = pieceEnd + 1;
+      return range;
+    }
+    function addPiece(range, extra, slot) {
+      pieces.push({ index: pieces.length, start: range.start, end: range.end, extra: extra, slot: slot });
+      batchBytes += range.end - range.start + 1;
+    }
+    var usable = slots.filter(function (slot) { return !slot.explore && slotBytes(slot) > 0; });
+    if (!usable.length) usable = slots.filter(function (slot) { return !slot.explore; });
+    if (extraQueue.length) {
+      for (var si = 0; si < slots.length; si += 1) {
+        var slice = slotBytes(slots[si]);
+        if (!slice) continue;
+        var range = slots[si].explore ? null : take(mustQueue, slice);
+        if (range) { addPiece(range, false, slots[si]); continue; }
+        if (batchBytes >= BTRA_MAX_BATCH) break;
+        range = take(extraQueue, Math.min(slice, BTRA_MAX_BATCH - batchBytes));
+        if (range) addPiece(range, true, slots[si]);
+      }
+    } else {
+      var sumBps = 0;
+      for (var ub = 0; ub < usable.length; ub += 1) sumBps += usable[ub].bps;
+      for (var ws = 0; ws < usable.length && mustQueue.length; ws += 1) {
+        var share = Math.max(BTRA_MIN_SLOT, Math.min(BTRA_MAX_PIECE, Math.round(mustBytes * usable[ws].bps / sumBps)));
+        var part = take(mustQueue, share);
+        if (part) addPiece(part, false, usable[ws]);
       }
     }
-    cut(missing, false);
-    cut(extras, true);
+    // Whatever is left of the App's bytes (a big request, a slow network): more rounds over the
+    // fastest connections; those pieces queue up behind the first ones.
+    for (var cycle = 0; mustQueue.length && cycle < 256; cycle += 1) {
+      var again = usable[cycle % Math.max(1, Math.min(usable.length, 8))];
+      if (!again) break;
+      var more = take(mustQueue, Math.max(BTRA_MIN_SLOT, slotBytes(again)));
+      if (more) addPiece(more, false, again);
+    }
     var mustCount = 0;
     for (var pc = 0; pc < pieces.length; pc += 1) if (!pieces[pc].extra) mustCount += 1;
-    // One wave only: read-ahead that would not fit into the thread count is left for next time.
-    while (pieces.length + (duplicateMust ? mustCount : 0) > config.threads && pieces[pieces.length - 1].extra) pieces.pop();
-    var expectedPieceMs = 800 + pieceSize / Math.max(20 * 1024 / 1000, state.stats.bps ? state.stats.bps / Math.max(1, Math.min(config.threads, pieces.length)) : 60 * 1024 / 1000);
 
     var failed = false;
     var delivered = false;
@@ -733,6 +793,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var launchedAt = 0;
     var mustDoneAt = 0;
     var inflight = 0;
+    var hostInflight = {};
     var queue = pieces.slice();
     var tasks = [];
     var goodHosts = [];
@@ -740,11 +801,28 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var fetchedBytes = 0;
     var hedges = 0;
 
+    function strikePending(reason) {
+      // Mirrors whose pieces are still outstanding well after their slice time get a "late" mark:
+      // their speed estimate drops (smaller pieces next time), and three in a row bench them.
+      var lateLine = Date.now() - (BTRA_SLICE_MS + 300);
+      var marked = {};
+      for (var index = 0; index < tasks.length; index += 1) {
+        var task = tasks[index];
+        if (task.done || task.inflight <= 0 || !task.launchedAt) continue;
+        // An exploration piece gets no margin: a mirror that cannot deliver its small piece in the
+        // slice time is not one to explore again soon. One mark per mirror per batch.
+        var lateHost = task.used[task.used.length - 1];
+        if (marked[lateHost]) continue;
+        if (task.launchedAt < lateLine || (task.piece.slot.explore && task.launchedAt < Date.now() - BTRA_SLICE_MS)) { marked[lateHost] = true; change("late", lateHost, Date.now(), reason); }
+      }
+    }
+
     function giveUp(reason) {
       if (failed || finished) return;
       failed = true;
       change("bump", "failed", 1);
       change("set", "lastError", reason);
+      change("rdone", pathKey, start, startedAt, "fail", Date.now() - startedAt);
       var key = "origin:" + originHost;
       change("streak", key, 1);
       if ((state.streaks[key] || 0) >= 4) {
@@ -752,7 +830,8 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         change("streak", key, null);
         notifyOnce("breaker-origin", 5 * 60000, "BTR App 模式暂时让路", originHost, "连续几次没能从镜像节点拿到数据（" + reason + "），先原样放行 5 分钟。");
       }
-      storeExtras();
+      strikePending(reason);
+      storeFetched();
       finish({});
     }
 
@@ -764,7 +843,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       $httpClient.get({
         url: "https://" + host + path + mirrorQuery,
         headers: headers,
-        timeout: Math.round(expectedPieceMs * 3 + 4000),
+        timeout: BTRA_PIECE_TIMEOUT,
         "binary-mode": true,
         "auto-cookie": false
       }, function (error, response, data) {
@@ -797,30 +876,19 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       });
     }
 
+    // Retries and hedges go to the fastest mirror that still has a free connection and has not
+    // been asked for this piece; mirrors that answered in this very run count as fastest.
     function pickHost(piece, attempt, used) {
-      var host = "";
-      if (attempt > 0) {
-        for (var g = 0; g < goodHosts.length && !host; g += 1) {
-          var candidate = goodHosts[(piece.index + attempt + g) % goodHosts.length];
-          if (used.indexOf(candidate) < 0) host = candidate;
-        }
+      if (attempt === 0 && used.indexOf(piece.slot.host) < 0) return piece.slot.host;
+      var candidates = goodHosts.concat(knownHosts, unknownHosts, pool);
+      var seen = {};
+      for (var index = 0; index < candidates.length; index += 1) {
+        var host = candidates[index];
+        if (seen[host] || used.indexOf(host) >= 0) continue;
+        seen[host] = true;
+        if ((hostInflight[host] || 0) < BTRA_PER_HOST) return host;
       }
-      // Round robin inside the active set. One read-ahead piece per batch (a few in a big one) is
-      // given to a mirror nobody has measured yet, mirrors never tried first: a dead one costs at
-      // most one small gap in the cache, and after a few batches every mirror is known.
-      var base = trusted;
-      var explore = pool.filter(function (candidate) { return base.indexOf(candidate) < 0; });
-      explore.sort(function (a, b) { var ra = state.hosts[a], rb = state.hosts[b]; return ((ra ? ra.ok + ra.bad : 0) - (rb ? rb.ok + rb.bad : 0)) || (speedOf(b) - speedOf(a)); });
-      var exploring = piece.extra && (piece.index - mustCount) % 16 === 0 && explore.length > 0 && attempt === 0 && known_.length < pool.length;
-      if (exploring) piece.exploring = true;
-      var order = exploring ? explore.concat(base) : base.concat(explore);
-      var span = exploring ? explore.length : base.length;
-      var first = (rotation + piece.index + attempt * 3) % span;
-      for (var step = 0; step < order.length && !host; step += 1) {
-        var next = order[(first + step) % order.length];
-        if (used.indexOf(next) < 0) host = next;
-      }
-      return host;
+      return "";
     }
 
     function learnTotal(size, response) {
@@ -842,7 +910,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     }
 
     function pump() {
-      while (queue.length && inflight < config.threads && !failed && !finished) {
+      while (queue.length && inflight < config.conns && !failed && !finished) {
         var piece = queue.shift();
         if (!launchedAt) launchedAt = Date.now();
         var task = createTask(piece);
@@ -854,20 +922,21 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     function createTask(piece) {
       var task = { piece: piece, done: false, launched: 0, inflight: 0, used: [] };
       task.launch = function () {
-        if (task.done || failed || finished || task.launched >= (piece.extra ? 2 : 3)) return false;
-        if (task.launched > 0 && Date.now() - startedAt > BTRA_DEADLINE - 2000) return false;
+        if (task.done || failed || finished || task.launched >= (piece.extra ? 2 : 4)) return false;
         var host = pickHost(piece, task.launched, task.used);
         if (!host) return false;
         if (!task.launched) task.launchedAt = Date.now();
         task.launched += 1;
         task.inflight += 1;
         inflight += 1;
+        hostInflight[host] = (hostInflight[host] || 0) + 1;
         task.used.push(host);
         requestPiece(host, piece, function (problem, data, range, response, ms, eof) {
           task.inflight -= 1;
           inflight -= 1;
+          hostInflight[host] -= 1;
           if (finished || failed) {
-            if (delivered && !failed && !problem && !eof && piece.extra && !task.done) { task.done = true; lateStore(piece, data); }
+            if (delivered && !failed && !problem && !eof && !task.done) { task.done = true; lateStore(piece, data); }
             return;
           }
           if (eof) {
@@ -930,18 +999,19 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       for (var index = 0; index < tasks.length; index += 1) if (!tasks[index].done && !tasks[index].piece.extra) open += 1;
       if (!open) return;
       if (!byTimer && (open > 2 || open === mustCount)) return;
-      var budget = 3 - hedges;
+      var budget = BTRA_HEDGE_BUDGET - hedges;
       for (var pick = 0; pick < tasks.length && budget > 0; pick += 1) {
         var task = tasks[pick];
-        if (!task.done && !task.piece.extra && task.inflight === 1 && task.launched === 1 && task.launch()) { budget -= 1; hedges += 1; }
+        if (!task.done && !task.piece.extra && task.inflight >= 1 && task.launched <= 2 && task.launch()) { budget -= 1; hedges += 1; }
       }
     }
 
-    function storeExtras() {
+    function storeFetched() {
       if (!caching) return;
-      // Completed read-ahead pieces, merged into contiguous runs; each run becomes one cache entry.
+      // Everything fetched (the App's bytes too, for a retry or a step back) merged into contiguous
+      // runs; each run becomes one cache entry.
       var list = [];
-      for (var index = 0; index < results.length; index += 1) if (results[index] && results[index].extra) list.push(results[index]);
+      for (var index = 0; index < results.length; index += 1) if (results[index]) list.push(results[index]);
       list.sort(function (a, b) { return a.start - b.start; });
       var run = [];
       var runBytes = 0;
@@ -955,14 +1025,14 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         runBytes = 0;
       }
       for (var l = 0; l < list.length; l += 1) {
-        if (run.length && run[run.length - 1].start + run[run.length - 1].data.length !== list[l].start) flush();
+        if (run.length && (run[run.length - 1].start + run[run.length - 1].data.length !== list[l].start || runBytes + list[l].data.length > 1048576)) flush();
         run.push(list[l]);
         runBytes += list[l].data.length;
       }
       flush();
     }
 
-    // Experiment 1 in practice: if Loon keeps this run alive after $done, read-ahead pieces that
+    // Should Loon keep this run alive after $done (it does not, as far as is known), pieces that
     // arrive late still go into the cache (bookkeeping straight in the store; the run's own ops are
     // long committed).
     function lateStore(piece, data) {
@@ -986,28 +1056,22 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       if (failed || finished || delivered || mustLeft) return;
       // Pieces sent to unmeasured mirrors are not waited for: they arrive or they do not.
       var pendingCore = 0;
-      for (var pending = 0; pending < tasks.length; pending += 1) if (!tasks[pending].done && tasks[pending].piece.extra && !tasks[pending].piece.exploring) pendingCore += 1;
+      for (var pending = 0; pending < tasks.length; pending += 1) if (!tasks[pending].done && tasks[pending].piece.extra && !tasks[pending].piece.slot.explore) pendingCore += 1;
       if (extraLeft > 0 && !pendingCore) extraLeft = 0;
       if (extraLeft > 0) {
         if (typeof setTimeout !== "function") extraLeft = 0;
         else {
-          // Read-ahead pieces are the same size as the App's, so the healthy ones arrive at about
-          // the same time; the answer is not held up for long on account of the others.
+          // Every piece was sized to take about BTRA_SLICE_MS, so the healthy read-ahead pieces are
+          // due by then (plus connection set-up); the answer is not held up beyond that.
           if (graceTimer === null) {
-            var grace = Math.max(250, Math.min(800, Math.round((mustDoneAt - launchedAt) * 0.2)));
+            var grace = Math.max(250, launchedAt + BTRA_SLICE_MS + 600 - Date.now());
             graceTimer = setTimeout(function () { extraLeft = 0; settle(); }, grace);
           }
           return;
         }
       }
       delivered = true;
-      // A mirror that was asked early and still has not answered while the others are long done is
-      // the black-holed kind: a strike (two in a row bench it), so it is not asked again soon.
-      var lateLine = Date.now() - (mustDoneAt - launchedAt) * 0.75;
-      for (var late = 0; late < tasks.length; late += 1) {
-        var slow = tasks[late];
-        if (!slow.done && slow.inflight > 0 && slow.launchedAt && slow.launchedAt < lateLine) change("host", slow.used[slow.used.length - 1], false, Date.now());
-      }
+      strikePending("late");
       var body = assemble();
       if (!body) { giveUp("拼装后的长度不符"); return; }
       var elapsed = Math.max(1, Date.now() - startedAt);
@@ -1017,37 +1081,21 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       change("bump", "prepMs", launchedAt - startedAt);
       change("bump", "mustMs", mustDoneAt - startedAt);
       change("bump", "allMs", elapsed);
-      // Only batches that keep the threads busy say something about the speed; a small gap filled
-      // with a few pieces is bound by latency, not throughput.
-      if (pieces.length >= config.threads / 2) change("ewma", "bps", fetchedBytes / batchMs);
+      change("set", "lastCapacity", capacity);
+      // Only batches that keep the connections busy say something about the speed; a small gap
+      // filled with a few pieces is bound by latency, not throughput.
+      if (pieces.length >= slots.length / 2) change("ewma", "bps", fetchedBytes / batchMs);
       if (state.streaks["origin:" + originHost]) change("streak", "origin:" + originHost, null);
-      notifyOnce("working", 6 * 3600000, "BTR App 模式正在加速", config.threads + " 线程 · " + (config.overseas ? "海外 CDN" : "大陆 CDN"), "刚才这一批 " + sizeText(fetchedBytes) + " 用了 " + (batchMs / 1000).toFixed(1) + " 秒（" + pieces.length + " 个子块）。统计页：" + BTRA_STATUS_URL);
-      storeExtras();
-      experiments();
+      notifyOnce("working", 6 * 3600000, "BTR App 模式正在加速", config.conns + " 连接 · " + (config.overseas ? "海外 CDN" : "大陆 CDN"), "刚才这一批 " + sizeText(fetchedBytes) + " 用了 " + (batchMs / 1000).toFixed(1) + " 秒（" + pieces.length + " 个子块）。统计页：" + BTRA_STATUS_URL);
+      storeFetched();
       respond(body, cachedBytes, pieces.length, elapsed);
-    }
-
-    // Experiments 1 and 2, on some of the runs: what happens to work that is still pending when
-    // this run answers? Counted directly in the store, since the run is over by then.
-    function experiments() {
-      if (typeof setTimeout !== "function" || (state.stats.seen || 0) > 400 || !goodHosts.length) return;
-      var seen = state.stats.seen || 0;
-      if (seen % 5 === 0) {
-        change("bump", "e1sent", 1);
-        setTimeout(function () { bumpDirect("e1timer"); }, 400);
-        var headers = { "X-BTR-Sub": "1", Range: "bytes=0-0" };
-        $httpClient.get({ url: "https://" + goodHosts[0] + path + mirrorQuery, headers: headers, timeout: 8000, "binary-mode": true, "auto-cookie": false }, function () { bumpDirect("e1http"); });
-      }
-      if (seen % 7 === 0) {
-        change("bump", "e2sent", 1);
-        $httpClient.get({ url: BTRA_SPAWN_URL, headers: { "X-BTR-Sub": "1" }, timeout: 10000, "auto-cookie": false }, function () {});
-      }
     }
 
     if (typeof setTimeout === "function") {
       setTimeout(function () { giveUp("超过 " + Math.round(BTRA_DEADLINE / 1000) + " 秒还没拼齐"); }, BTRA_DEADLINE);
-      setTimeout(function () { hedge(true); }, Math.round(expectedPieceMs * 1.7));
-      setTimeout(function () { hedge(true); }, Math.round(expectedPieceMs * 2.6));
+      setTimeout(function () { hedge(true); }, 1200);
+      setTimeout(function () { hedge(true); }, 2000);
+      setTimeout(function () { hedge(true); }, 3200);
     }
     pump();
     if (!mustLeft) settle();

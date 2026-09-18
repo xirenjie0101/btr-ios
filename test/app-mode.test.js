@@ -24,7 +24,7 @@ let proxyPort = 18491;
 const sha = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
 const file = (name) => fs.readFileSync(path.join(ROOT, "test", "media", name));
 const AKAMAI = "upos-hz-mirrorakam.akamaized.net";
-const DEFAULTS = { threads: "32", ahead: "4MB", cache: "8MB", cdn: "大陆CDN", openEnded: "分块答复", notify: true };
+const DEFAULTS = { conns: "32", ahead: "4MB", cache: "16MB", cdn: "大陆CDN", openEnded: "分块答复", notify: true };
 const cachedBytes = (state) => state.cache.reduce((sum, entry) => sum + entry.b, 0);
 
 test.before(() => mock.start());
@@ -62,7 +62,8 @@ test("segment-style reading (bytes=a-b, ~1 MB at a time, as the real app does): 
   assert.equal(mock.stats.hosts[AKAMAI], undefined, "the slow origin host was not needed at all");
   assert.ok(mock.stats.maxConcurrent >= 8, `parallel connections: ${mock.stats.maxConcurrent}`);
   assert.equal(mock.stats.signatureFailures, 0);
-  assert.ok(state.hosts["upos-sz-mirrorbd.bilivideo.com"]?.bad >= 1, "the mirror that never answers got a strike");
+  assert.equal(state.hosts["upos-sz-mirrorbd.bilivideo.com"]?.ok || 0, 0, "the mirror that never answers never got a chance to matter");
+  assert.ok((mock.stats.hosts["upos-sz-mirrorbd.bilivideo.com"]?.requests || 0) <= 6, "…and was only ever probed with a few read-ahead pieces");
   assert.ok(loon.log.notifications.some((line) => /正在加速/.test(line)), "one notification says it works");
   assert.equal(loon.log.notifications.filter((line) => /正在加速/.test(line)).length, 1, "…and only one");
 });
@@ -110,13 +111,18 @@ test("short answers close the connection, complete ones need not", async () => {
   assert.equal(wide.response.headers["Content-Range"], `bytes 0-1299999/${size}`);
   assert.equal(wide.response.body.length, 1300000);
   assert.deepEqual(Buffer.from(wide.response.body), file("a96.m4s").subarray(0, 1300000));
-  // …but one that would not fit in memory comfortably is answered block by block
+  // …but one that would not fit in memory comfortably is answered in what one batch can carry
   const videoUrl = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
   const huge = await runLoonScript({
     code: fs.readFileSync(SCRIPT, "utf8"), httpClientPort: mock.port, store: loon.store, timeoutMs: 30000,
     argument: loon.settings.argument, request: { url: videoUrl, method: "GET", headers: { Range: "bytes=1048576-24000000" } }
   });
-  assert.equal(huge.response.headers["Content-Range"], `bytes 1048576-${1048576 + 2097152 - 1}/${file("v720.m4s").length}`);
+  const hugeRange = /^bytes 1048576-(\d+)\/(\d+)$/.exec(huge.response.headers["Content-Range"]);
+  assert.ok(hugeRange, huge.response.headers["Content-Range"]);
+  const hugeBytes = Number(hugeRange[1]) - 1048576 + 1;
+  assert.ok(hugeBytes >= 2097152 && hugeBytes <= 8 * 1048576, `between 2 and 8 MB: ${hugeBytes}`);
+  assert.equal(huge.response.body.length, hugeBytes);
+  assert.equal(Number(hugeRange[2]), file("v720.m4s").length);
   assert.equal(huge.response.headers.Connection, "close");
 });
 
@@ -153,6 +159,35 @@ test("cache stays within its limit and lets go of what has been played", async (
   assert.ok(state.stats.hits >= 3);
 });
 
+test("mirrors of very different speed (as measured on a phone): the fast ones carry the batch, the slow ones never hold it up", async () => {
+  await freshLoon();
+  const KB = 1024;
+  Object.assign(mock.state.profiles, {
+    "upos-sz-mirrorali.bilivideo.com": { latency: 200, rate: 250 * KB },
+    "upos-sz-mirror14b.bilivideo.com": { latency: 200, rate: 210 * KB },
+    "upos-sz-mirrorbos.bilivideo.com": { latency: 200, rate: 56 * KB },
+    "upos-sz-estgoss.bilivideo.com": { latency: 200, rate: 26 * KB },
+    "upos-sz-mirrorcos.bilivideo.com": { latency: 200, rate: 32 * KB },
+    "upos-sz-mirrorbd.bilivideo.com": { latency: 200, rate: 17 * KB },
+    "upos-sz-mirror08c.bilivideo.com": { latency: 200, rate: 14 * KB },
+    "upos-sz-mirrorhw.bilivideo.com": { latency: 200, rate: 12 * KB }
+  });
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const original = file("v720.m4s");
+  const result = await segmentPlayer({ proxyPort, url, size: original.length, segment: 1048576, stopAfterBytes: 12 * 1048576 });
+  assert.equal(sha(result.bytes), sha(original.subarray(0, 12 * 1048576)));
+  const state = loon.state();
+  assert.equal(state.stats.failed || 0, 0, "no batch ran into the deadline");
+  assert.equal(loon.log.passedThrough, 0);
+  const rate = 12 * 1048576 / result.seconds;
+  assert.ok(rate > 1024 * 1024, `${(rate / 1024).toFixed(0)} KiB/s: over 1 MiB/s although most mirrors crawl`);
+  const fast = (mock.stats.hosts["upos-sz-mirrorali.bilivideo.com"]?.bytes || 0) + (mock.stats.hosts["upos-sz-mirror14b.bilivideo.com"]?.bytes || 0);
+  const all = Object.values(mock.stats.hosts).reduce((sum, item) => sum + item.bytes, 0);
+  assert.ok(fast / all > 0.55, `the two fast mirrors carried ${Math.round(fast / all * 100)}% of the bytes`);
+  assert.ok(state.stats.slowRuns === undefined || state.stats.slowRuns <= 1, `answers over 4 s: ${state.stats.slowRuns}`);
+  assert.ok(state.hosts["upos-sz-mirrorali.bilivideo.com"].bps > state.hosts["upos-sz-mirrorbos.bilivideo.com"].bps * 2, "speeds were learned");
+});
+
 test("when the store cannot hold the data, playback goes on without a cache", async () => {
   await freshLoon();
   const original = file("v360.m4s");
@@ -172,7 +207,7 @@ test("when the store cannot hold the data, playback goes on without a cache", as
 
 test("a player that cannot take short answers trips the fuse and gets its stream the old way", async () => {
   await freshLoon();
-  const url = mock.mediaUrl(AKAMAI, 1001, "v360", "iphone");
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
   const seen = await stubbornPlayer({ proxyPort, url, attempts: 6 });
   assert.deepEqual(seen.slice(0, 3).map((item) => item.byScript), [true, true, true]);
   assert.equal(seen.at(-1).complete, true, "after the fuse the full-length answer comes straight from the CDN");
@@ -182,7 +217,7 @@ test("a player that cannot take short answers trips the fuse and gets its stream
   const state = loon.state();
   assert.ok(state.breaker.shortReply.until > Date.now());
   // bounded requests are still served: the fuse only covers the partial-answer trick
-  const original = file("v360.m4s");
+  const original = file("v720.m4s");
   const part = await segmentPlayer({ proxyPort, url, size: original.length, segment: 524288, stopAfterBytes: 1048576 });
   assert.deepEqual(part.bytes, original.subarray(0, 1048576));
   assert.ok(loon.state().stats.served >= 1048576 + 3 * 1048576);
@@ -273,7 +308,7 @@ test("things the script must not touch", async () => {
   assert.ok(mock.stats.ranges.length > 0);
 });
 
-test("status page and the self-addressed probe", async () => {
+test("status page", async () => {
   await freshLoon();
   const url = mock.mediaUrl(AKAMAI, 1001, "a96", "iphone");
   await ffmpegLikePlayer({ proxyPort, url });
@@ -283,13 +318,10 @@ test("status page and the self-addressed probe", async () => {
   assert.match(page.response.body, /交给 App<\/td><td>1\.3 MB/);
   assert.match(page.response.body, /开放式 2/);
   assert.match(page.response.body, /bili-universal/);
-  assert.match(page.response.body, /32 线程 · 预读 4\.0 MB · 缓存上限 8\.0 MB · 大陆 CDN · 大范围请求：分块答复/);
+  assert.match(page.response.body, /32 条连接 · 预读 4\.0 MB · 缓存上限 16\.0 MB · 大陆 CDN · 大范围请求：分块答复/);
   assert.match(page.response.body, /存储自检<\/td><td>通过/);
   assert.match(page.response.body, /KB\/s/, "mirror speeds are shown");
-  const spawn = await runLoonScript({ code, store: loon.store, argument: loon.settings.argument, request: { url: "https://www.bilibili.com/__btr_app__/spawn", method: "GET", headers: { "X-BTR-Sub": "1" } } });
-  assert.equal(spawn.response.status, 204);
-  assert.equal(loon.state().stats.e2seen, 1);
-  assert.equal(loon.state().stats.e2alive, 1);
+  assert.match(page.response.body, /重复位置<\/td><td>0 次/);
   const reset = await runLoonScript({ code, store: loon.store, argument: loon.settings.argument, request: { url: "https://www.bilibili.com/__btr_app__/?reset=1", method: "GET", headers: {} } });
   assert.match(reset.response.body, /交给 App<\/td><td>0 KB/);
   assert.equal(Array.from(loon.store.keys()).filter((key) => key.startsWith("btr_ios_app_c:") && loon.store.get(key)).length, 0, "reset drops the cached bytes too");
