@@ -7,7 +7,7 @@
 #!tag = 哔哩哔哩, 视频加速
 #!system = iOS, iPadOS, macOS
 #!date = 2026-09-18
-#!version = 1.3.0
+#!version = 1.4.0
 
 [Argument]
 injectButton = switch,true,tag=视频页悬浮按钮,desc=在 Safari 里打开 B 站视频页时，右下角显示“⚡ BTR 加速播放”按钮

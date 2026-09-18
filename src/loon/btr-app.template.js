@@ -25,14 +25,22 @@ var BTRA_VERSION = "__BTRI_VERSION__";
 var BTRA_STORE_KEY = "btr_ios_app_v2";
 var BTRA_CACHE_PREFIX = "btr_ios_app_c:";
 var BTRA_STATUS_URL = "https://www.bilibili.com/__btr_app__/";
+// Every distinct mirror is an independent route with its own bandwidth, so the way to go faster
+// over a congested overseas link is to add more of them together, not to lean on one. A mirror
+// that turns out dead or wrong-signed simply fails its probes and is rested; the cost of listing
+// one that does not work is a couple of wasted probes.
 var BTRA_MAINLAND = [
-  "upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com",
-  "upos-sz-mirror08c.bilivideo.com", "upos-sz-mirrorbd.bilivideo.com", "upos-sz-mirror14b.bilivideo.com",
-  "upos-sz-estgoss.bilivideo.com", "upos-sz-mirrorcos.bilivideo.com"
+  "upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorali02.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com",
+  "upos-sz-mirrorhwb.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com", "upos-sz-mirror08c.bilivideo.com",
+  "upos-sz-mirror08h.bilivideo.com", "upos-sz-mirrorbd.bilivideo.com", "upos-sz-mirror14b.bilivideo.com",
+  "upos-sz-estgoss.bilivideo.com", "upos-sz-mirrorcos.bilivideo.com", "upos-sz-mirrorcosb.bilivideo.com",
+  "upos-sz-upcdntx.bilivideo.com", "upos-sz-upcdnbda2.bilivideo.com", "upos-sz-upcdnqn.bilivideo.com",
+  "upos-sz-upcdnws.bilivideo.com"
 ];
 var BTRA_OVERSEAS = [
-  "upos-sz-mirrorcosov.bilivideo.com", "upos-sz-mirroraliov.bilivideo.com",
-  "cn-hk-eq-01-01.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com"
+  "upos-sz-mirroraliov.bilivideo.com", "upos-sz-mirrorcosov.bilivideo.com",
+  "cn-hk-eq-01-01.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com",
+  "cn-hk-eq-bcache-01.bilivideo.com"
 ];
 var BTRA_SLICE_MS = 1000;             // every connection is given what it should deliver in this time
 var BTRA_EXTRA_SHARE = 0.8;            // read-ahead pieces are cut a little shorter, so they land first
@@ -40,7 +48,8 @@ var BTRA_BUSY_KEY = "btr_ios_app_busy";
 var BTRA_BUSY_MS = 2500;               // how long a connection started by another run is assumed to be in use
 var BTRA_ASSUMED_BPS = 40;             // bytes per ms assumed for a mirror nobody has measured (≈ 40 KB/s)
 var BTRA_PER_HOST = 6;                 // connections to one mirror at a time (iOS queues more than that)
-var BTRA_MIN_SLOT = 32 * 1024;
+var BTRA_EXPLORE = 4;                  // unmeasured mirrors probed per batch, so a wider pool is learned quickly
+var BTRA_MIN_SLOT = 8 * 1024;          // a mirror doing even ~8 KB/s still earns a slot: bandwidth is summed
 var BTRA_MAX_PIECE = 1024 * 1024;
 var BTRA_MAX_BATCH = 8 * 1024 * 1024;
 var BTRA_MAX_REPLY = 8 * 1024 * 1024;
@@ -231,11 +240,15 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       }
     }
     else if (kind === "late") {
+      // A "late" mark only means this mirror is slow right now — which, over a congested overseas
+      // link, is true of nearly all of them. A slow mirror still adds bandwidth, so lateness must
+      // never bench it or knock down its measured speed (doing so used to snowball: every mirror
+      // slow -> every mirror marked late -> speeds crushed toward zero -> the fastest ones benched
+      // -> even less bandwidth). We only count it, for the status page. Real speed is learned from
+      // what actually arrives (the "host" op), and only hard failures rest a mirror.
       var lateHost = hostRecord(state, op[1]);
       lateHost.late = (lateHost.late || 0) + 1;
       lateHost.lateStreak = (lateHost.lateStreak || 0) + 1;
-      if (lateHost.bps) lateHost.bps *= 0.75;
-      if (lateHost.lateStreak >= 3 && !(lateHost.until > op[2])) { lateHost.lateStreak = 0; lateHost.until = op[2] + 5 * 60000; }
     }
     else if (kind === "breaker") state.breaker[op[1]] = op[2];
     else if (kind === "streak") state.streaks[op[1]] = op[2] === null ? 0 : (state.streaks[op[1]] || 0) + op[2];
@@ -255,10 +268,13 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       } else {
         item.bad += 1;
         item.streak += 1;
-        // Two failures in a row: rest for 5 minutes, then 15, then an hour while it keeps failing.
-        if (item.streak >= 2 && !(item.until > op[3])) {
+        // Only a mirror that keeps failing outright is rested (dead host, wrong signature, 403).
+        // Three in a row, because over a congested link the odd timeout is normal and does not mean
+        // the mirror is useless. Rest 3 minutes, then 9, capped at half an hour, and one success
+        // clears it — we would rather keep a flaky mirror contributing than lose its bandwidth.
+        if (item.streak >= 3 && !(item.until > op[3])) {
           item.benches = (item.benches || 0) + 1;
-          item.until = op[3] + Math.min(60, 5 * Math.pow(3, item.benches - 1)) * 60000;
+          item.until = op[3] + Math.min(30, 3 * Math.pow(3, item.benches - 1)) * 60000;
         }
       }
     }
@@ -498,10 +514,16 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       }
     }
     var hosts = [];
+    var liveHosts = 0;
+    var benchedHosts = 0;
+    var aggBps = 0;
     for (var host in current.hosts) {
       var item = current.hosts[host];
+      if (item.until > now) benchedHosts += 1;
+      else if (item.bps > 0) { liveHosts += 1; aggBps += item.bps; }
       hosts.push(escapeHtml(shortHost(host) + "：成功 " + (item.ok || 0) + " / 失败 " + (item.bad || 0) + " / 迟到 " + (item.late || 0) + (item.bps ? " · " + Math.round(item.bps * 1000 / 1024) + " KB/s" : "") + (item.until > now ? "（停用中）" : "")));
     }
+    var hostSummary = "在用 " + liveHosts + " 个镜像 · 合计约 " + Math.round(aggBps * 1000 / 1024) + " KB/s" + (benchedHosts ? " · 停用 " + benchedHosts + " 个" : "");
     var cached = 0;
     for (var c = 0; c < current.cache.length; c += 1) cached += current.cache[c].b;
     var test = current.flags.storeTest;
@@ -536,7 +558,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       ["原样放行", escapeHtml((stats.passed || 0) + " 次" + (stats.lastPass ? "（最近一次原因：" + stats.lastPass + "）" : ""))],
       ["失败后放行", escapeHtml((stats.failed || 0) + " 次" + (stats.lastError ? "（最近一次：" + stats.lastError + "）" : ""))],
       ["保险丝", breakers.length ? breakers.join("<br>") : "没有跳闸"],
-      ["节点", hosts.length ? hosts.join("<br>") : "还没有记录"],
+      ["节点", hosts.length ? hostSummary + "<br>" + hosts.join("<br>") : "还没有记录"],
       ["答复之后才到的块", escapeHtml((stats.late || 0) + " 块补存进了缓存（Loon 通常在答复后立刻结束脚本，所以这个数一般是 0）")],
       ["最近 12 次", runLines.length ? runLines.join("<br>") : "还没有记录"],
       ["App 标识", escapeHtml(stats.agent || "还没有记录")]
@@ -645,7 +667,12 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
      * moment, and the fast mirrors carry most of it. Mirrors nobody has measured get one small
      * read-ahead piece now and then, which is how they become known.
      */
-    var everyMirror = config.overseas ? BTRA_OVERSEAS : BTRA_MAINLAND;
+    // Both sets are always candidates — from overseas the mainland mirrors and the Hong Kong /
+    // Akamai nodes travel different routes, and using them together is what adds up to real
+    // bandwidth. The CDN setting only decides which set is tried first; measured speed then sorts
+    // out who actually carries the load. A mirror resting after repeated hard failures is skipped.
+    var preferred = config.overseas ? BTRA_OVERSEAS : BTRA_MAINLAND;
+    var everyMirror = preferred.concat(BTRA_MAINLAND, BTRA_OVERSEAS).filter(function (host, index, all) { return all.indexOf(host) === index; });
     var pool = everyMirror.filter(function (host) { return !(state.hosts[host] && state.hosts[host].until > now); });
     if (pool.length < 2) pool = everyMirror.slice();
     var speedOf = function (host) { var record = state.hosts[host]; return record && record.bps > 0 ? record.bps : 0; };
@@ -675,16 +702,40 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         slots.push({ host: candidate, bps: speedOf(candidate) || assumedBps, explore: false });
       }
     } else {
+      // Bandwidth is the sum over mirrors, so first give one connection to EVERY mirror we trust
+      // (fastest first) rather than piling several onto the top few. Then probe a handful of
+      // unmeasured mirrors so a wide pool is learned. Only then are spare connections handed back to
+      // the fastest mirrors, up to BTRA_PER_HOST each, counting whatever the other stream is using.
+      var perHostCount = {};
+      var roomFor = function (host) { return BTRA_PER_HOST - busyCount(host) - (perHostCount[host] || 0); };
+      var pushSlot = function (host, explore) {
+        perHostCount[host] = (perHostCount[host] || 0) + 1;
+        slots.push({ host: host, bps: speedOf(host) || Math.min(assumedBps, BTRA_ASSUMED_BPS), explore: !!explore });
+      };
       for (var k = 0; k < knownHosts.length && slots.length < config.conns; k += 1) {
-        var room = Math.max(1, BTRA_PER_HOST - busyCount(knownHosts[k]));
-        for (var c = 0; c < room && slots.length < config.conns; c += 1) slots.push({ host: knownHosts[k], bps: speedOf(knownHosts[k]), explore: false });
+        if (roomFor(knownHosts[k]) > 0) pushSlot(knownHosts[k], false);
       }
-      // Exploration: up to two unmeasured mirrors get one slot each, in place of the slowest slots.
-      for (var u = 0; u < unknownHosts.length && u < 2; u += 1) {
-        if (slots.length >= config.conns) slots.pop();
-        slots.push({ host: unknownHosts[u], bps: Math.min(assumedBps, BTRA_ASSUMED_BPS), explore: true });
+      // Probe unmeasured mirrors hard while the roster is thin (a wide pool must be learned fast),
+      // then ease off to a single probe once enough are known, so read-ahead is not crowded out.
+      var exploreN = knownHosts.length >= 6 ? 1 : BTRA_EXPLORE;
+      for (var u = 0; u < unknownHosts.length && u < exploreN && slots.length < config.conns; u += 1) {
+        if (roomFor(unknownHosts[u]) > 0) pushSlot(unknownHosts[u], true);
+      }
+      var progress = true;
+      while (slots.length < config.conns && progress) {
+        progress = false;
+        for (var f = 0; f < knownHosts.length && slots.length < config.conns; f += 1) {
+          if (roomFor(knownHosts[f]) > 0) { pushSlot(knownHosts[f], false); progress = true; break; }
+        }
       }
     }
+    // Fastest connections first, probes last: the piece loop below hands out the App's own (blocking)
+    // bytes from the front of this list and the read-ahead from what remains, so both prefer the
+    // quick mirrors and the slow ones only ever pick up the furthest, most disposable read-ahead.
+    slots.sort(function (a, b) {
+      if (a.explore !== b.explore) return a.explore ? 1 : -1;
+      return b.bps - a.bps;
+    });
     var duplicateMust = fresh;
     busyNote(slots.map(function (slot) { return slot.host; }));
     // A connection's slice: what its mirror should deliver in BTRA_SLICE_MS. Too slow for even the

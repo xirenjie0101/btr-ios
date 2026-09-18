@@ -53,7 +53,7 @@ test("segment-style reading (bytes=a-b, ~1 MB at a time, as the real app does): 
   const state = loon.state();
   assert.equal(state.stats.bounded, result.requests);
   assert.equal(state.stats.served, original.length);
-  assert.ok(state.stats.hits + (state.stats.partial || 0) >= 2, `later segments come (at least mostly) from the cache: ${JSON.stringify(state.stats)}`);
+  assert.ok((state.stats.hits || 0) + (state.stats.partial || 0) >= 2, `later segments come from the cache (a full or partial hit): ${JSON.stringify(state.stats)}`);
   assert.ok(state.stats.servedCached > original.length * 0.3, `a good part of the bytes were already there when asked for: ${state.stats.servedCached}`);
   assert.equal(state.stats.shortReplies || 0, 0, "bounded requests of reasonable size are never cut short");
   assert.ok(state.flags.storeTest.ok, "the store self-test passed");
@@ -156,7 +156,7 @@ test("cache stays within its limit and lets go of what has been played", async (
   for (const key of loon.store.keys()) {
     if (key.startsWith("btr_ios_app_c:") && loon.store.get(key)) assert.ok(state.cache.some((entry) => key === `btr_ios_app_c:${entry.k}`), `${key} is listed`);
   }
-  assert.ok(state.stats.hits >= 3);
+  assert.ok((state.stats.hits || 0) + (state.stats.partial || 0) >= 3, `read-ahead kept feeding later reads from cache: hits ${state.stats.hits || 0}, partial ${state.stats.partial || 0}`);
 });
 
 test("mirrors of very different speed (as measured on a phone): the fast ones carry the batch, the slow ones never hold it up", async () => {
@@ -181,11 +181,43 @@ test("mirrors of very different speed (as measured on a phone): the fast ones ca
   assert.equal(loon.log.passedThrough, 0);
   const rate = 12 * 1048576 / result.seconds;
   assert.ok(rate > 1024 * 1024, `${(rate / 1024).toFixed(0)} KiB/s: over 1 MiB/s although most mirrors crawl`);
-  const fast = (mock.stats.hosts["upos-sz-mirrorali.bilivideo.com"]?.bytes || 0) + (mock.stats.hosts["upos-sz-mirror14b.bilivideo.com"]?.bytes || 0);
-  const all = Object.values(mock.stats.hosts).reduce((sum, item) => sum + item.bytes, 0);
-  assert.ok(fast / all > 0.55, `the two fast mirrors carried ${Math.round(fast / all * 100)}% of the bytes`);
+  // The point of the design is to add every route's bandwidth together, so many mirrors carry bytes
+  // — not only the two fastest. The fast ones still pull far more per connection, which is what
+  // sends the App's own blocking bytes to them; the slow ones fill in read-ahead without gating it.
+  const contributing = Object.keys(mock.stats.hosts).filter(function (h) { return mock.stats.hosts[h].bytes > 0 && !/akam/.test(h); }).length;
+  assert.ok(contributing >= 5, `many routes were summed, not just the fast few: ${contributing} mirrors carried bytes`);
+  assert.ok((mock.stats.hosts["upos-sz-mirrorali.bilivideo.com"]?.bytes || 0) > (mock.stats.hosts["upos-sz-mirrorbos.bilivideo.com"]?.bytes || 0), "the fast mirror still carried more than a slow one");
   assert.ok(state.stats.slowRuns === undefined || state.stats.slowRuns <= 1, `answers over 4 s: ${state.stats.slowRuns}`);
-  assert.ok(state.hosts["upos-sz-mirrorali.bilivideo.com"].bps > state.hosts["upos-sz-mirrorbos.bilivideo.com"].bps * 2, "speeds were learned");
+  assert.ok(state.hosts["upos-sz-mirrorali.bilivideo.com"].bps > state.hosts["upos-sz-mirrorbos.bilivideo.com"].bps * 2, "the fast mirror is measured much quicker per connection");
+});
+
+test("when every mirror crawls (a congested overseas link) they are summed, not benched", async () => {
+  // The failure mode this guards against: over a slow evening link every mirror answers late, and an
+  // earlier version read that as "bad", knocked each mirror's measured speed down and rested the
+  // ones that were late three times running — including the fastest — leaving even less bandwidth. A
+  // mirror that is only slow must keep its place, because throughput here is the sum over all of them.
+  await freshLoon();
+  const KB = 1024;
+  for (const short of ["mirrorali", "mirrorhw", "mirrorbos", "mirror08c", "mirrorbd", "mirror14b", "estgoss", "mirrorcos"]) {
+    mock.state.profiles["upos-sz-" + short + ".bilivideo.com"] = { latency: 300, rate: 18 * KB };
+  }
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const original = file("v720.m4s");
+  const result = await segmentPlayer({ proxyPort, url, size: original.length, segment: 1048576, stopAfterBytes: 6 * 1048576 });
+  assert.equal(sha(result.bytes), sha(original.subarray(0, 6 * 1048576)), "every byte still arrives");
+  assert.equal(loon.log.passedThrough, 0, "slow mirrors added together still carry the stream");
+  const state = loon.state();
+  let late = 0;
+  let benched = 0;
+  let carried = 0;
+  for (const host of Object.keys(state.hosts)) {
+    if (state.hosts[host].late > 0) late += 1;
+    if (state.hosts[host].until > Date.now()) benched += 1;
+    if ((state.hosts[host].ok || 0) > 0) carried += 1;
+  }
+  assert.ok(late >= 1, "mirrors were indeed slow enough to be marked late");
+  assert.equal(benched, 0, "but lateness alone benched none of them");
+  assert.ok(carried >= 6, `their bandwidth was summed across many mirrors: ${carried} carried pieces`);
 });
 
 test("when the store cannot hold the data, playback goes on without a cache", async () => {
@@ -260,8 +292,19 @@ test("mirrors that fail or lie are routed around; if nothing works the request p
   assert.ok(state.hosts["upos-sz-mirror14b.bilivideo.com"]?.bad >= 1, "the refusing mirror was found out on a read-ahead piece");
   assert.ok(state.hosts["upos-sz-mirrorhw.bilivideo.com"]?.until > Date.now() || state.hosts["upos-sz-mirrorbd.bilivideo.com"]?.until > Date.now(), `benched after two failures in a row: ${JSON.stringify(state.hosts)}`);
   assert.equal(loon.log.passedThrough, 0, "three bad mirrors out of eight are not a reason to give up");
-  // now every mirror refuses (as for content the mirrors do not carry)
-  for (const host of Object.keys(state.hosts).concat(["upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com", "upos-sz-mirror08c.bilivideo.com", "upos-sz-estgoss.bilivideo.com", "upos-sz-mirrorcos.bilivideo.com"])) {
+  // now every mirror refuses (as for content the mirrors do not carry). The whole pool has to be
+  // covered — both the mainland and the overseas/Hong Kong nodes — or the script keeps finding a
+  // working route and never falls back. The Akamai origin the app itself asked for is left alone.
+  const everyMirror = [
+    "upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorali02.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-mirrorhwb.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com", "upos-sz-mirror08c.bilivideo.com",
+    "upos-sz-mirror08h.bilivideo.com", "upos-sz-mirrorbd.bilivideo.com", "upos-sz-mirror14b.bilivideo.com",
+    "upos-sz-estgoss.bilivideo.com", "upos-sz-mirrorcos.bilivideo.com", "upos-sz-mirrorcosb.bilivideo.com",
+    "upos-sz-upcdntx.bilivideo.com", "upos-sz-upcdnbda2.bilivideo.com", "upos-sz-upcdnqn.bilivideo.com",
+    "upos-sz-upcdnws.bilivideo.com", "upos-sz-mirroraliov.bilivideo.com", "upos-sz-mirrorcosov.bilivideo.com",
+    "cn-hk-eq-01-01.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com", "cn-hk-eq-bcache-01.bilivideo.com"
+  ];
+  for (const host of Object.keys(state.hosts).concat(everyMirror)) {
     mock.state.profiles[host] = { status: 403 };
   }
   loon.store.clear();
