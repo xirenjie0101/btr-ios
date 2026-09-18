@@ -1,5 +1,5 @@
 #!name = BTR-iOS App 模式（线程撕裂者）
-#!desc = 让哔哩哔哩 App（国内版/国际版）取视频时多线程、多 CDN 并发下载，缓解海外看冷门、高码率视频卡顿。出错或不适用时自动原样放行。统计页：Safari 打开 https://www.bilibili.com/__btr_app__/ 。思路来自开源项目 Bilibili-thread-ripper，非官方。若同时装了 BiliUniverse Redirect 等改 B 站 CDN 的插件，请先关掉它们。
+#!desc = 让哔哩哔哩 App（国内版/国际版）取视频时多线程、多 CDN 并发预读，缓解海外看冷门、高码率视频卡顿。出错或不适用时自动原样放行。统计页：Safari 打开 https://www.bilibili.com/__btr_app__/ 。思路来自开源项目 Bilibili-thread-ripper，非官方。若同时装了 BiliUniverse Redirect 等改 B 站 CDN 的插件，请先关掉它们。
 #!author = BTR-iOS
 #!homepage = https://github.com/xirenjie0101/btr-ios
 #!icon = https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/icon.png
@@ -7,11 +7,12 @@
 #!tag = 哔哩哔哩, 视频加速
 #!system = iOS, iPadOS
 #!date = 2026-09-18
-#!version = 1.0.0
+#!version = 1.1.0
 
 [Argument]
-threads = select,"8","4","16","32",tag=并发线程,desc=每次取流同时开几条连接。先用 8，缓冲跟不上再试 16；不是越多越快
-chunk = select,"2MB","1MB","4MB",tag=每次答复的块大小,desc=App 发“一直读到底”的请求时，每次先答复这么多。块越大越省往返，但每块要等更久、也更吃内存
+threads = select,"32","16","64","8",tag=并发线程,desc=每一批同时开几条连接。到大陆节点的单条连接很慢（每条几十 KB/s），靠的是数量；插件每批连后面的几 MB 一起取回来（预读），线程越多一批取得越快。发热明显就调到 16
+ahead = select,"4MB","2MB","8MB","关闭",tag=预读大小,desc=App 要一小段时，顺便多取多少放进缓存，App 接着要的时候直接给。会按测得的速度自动缩放，这里是上限；关闭则只取 App 要的那一段
+cache = select,"8MB","4MB","16MB","关闭",tag=缓存上限,desc=预读的数据最多占多少存储。播放位置之前的、超过 10 分钟的会自动淘汰
 cdn = select,"大陆CDN","海外CDN",tag=CDN 模式,desc=海外看冷门视频选大陆 CDN（配合多线程）；到大陆线路特别差再试海外 CDN
 openEnded = select,"分块答复","原样放行",tag=大范围取流请求,desc=分块答复才能加速“一直读到底”的请求；如果开着插件 App 放不了视频，改成原样放行
 notify = switch,true,tag=通知,desc=开始加速、保险丝跳闸时发一条通知
@@ -25,13 +26,16 @@ force-http-engine-hosts = upos-sz-mirror*.bilivideo.com:80, cn-hk-eq-*.bilivideo
 AND,((DOMAIN-SUFFIX,bilivideo.com),(PROTOCOL,QUIC)),REJECT
 AND,((DOMAIN-SUFFIX,bilivideo.cn),(PROTOCOL,QUIC)),REJECT
 AND,((DOMAIN-KEYWORD,mirrorakam),(PROTOCOL,QUIC)),REJECT
+# 统计页也一样：Safari 走了 QUIC 的话 Loon 看不到这个请求，会直接打开 B 站的 404 页
+AND,((DOMAIN,www.bilibili.com),(PROTOCOL,QUIC)),REJECT
+AND,((DOMAIN,m.bilibili.com),(PROTOCOL,QUIC)),REJECT
 # 视频数据最好直连。如果你的配置会把 B 站 CDN 分流到代理节点，把下面两行开头的 # 去掉：
 # DOMAIN-SUFFIX,bilivideo.com,DIRECT
 # DOMAIN-SUFFIX,bilivideo.cn,DIRECT
 
 [Script]
-http-request ^https?:\/\/[^\/]+\/upgcxcode\/.+\.m4s script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式, timeout=30, argument=[{threads},{chunk},{cdn},{openEnded},{notify}]
-http-request ^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__ script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式统计页, timeout=10, argument=[{threads},{chunk},{cdn},{openEnded},{notify}]
+http-request ^https?:\/\/[^\/]+\/upgcxcode\/.+\.m4s script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式, timeout=30, argument=[{threads},{ahead},{cache},{cdn},{openEnded},{notify}]
+http-request ^https?:\/\/(?:www|m)\.bilibili\.com\/__btr_app__ script-path=https://raw.githubusercontent.com/xirenjie0101/btr-ios/main/dist/btr-app.js, tag=BTR App 模式统计页, timeout=10, argument=[{threads},{ahead},{cache},{cdn},{openEnded},{notify}]
 
 [MITM]
 hostname = upos-*.bilivideo.com, cn-hk-eq-*.bilivideo.com, *.mcdn.bilivideo.cn, upos-*-mirrorakam.akamaized.net, www.bilibili.com

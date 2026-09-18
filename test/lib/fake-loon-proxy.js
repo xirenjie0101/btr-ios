@@ -65,7 +65,7 @@ function createFakeLoon({ port, cdnPort, scriptPath, argument }) {
 
   return {
     port, store, log, settings,
-    state: () => JSON.parse(store.get("btr_ios_app_v1") || "null"),
+    state: () => JSON.parse(store.get("btr_ios_app_v2") || "null"),
     start: () => new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); }),
     stop: () => new Promise((resolve) => { for (const socket of sockets) socket.destroy(); server.close(() => resolve()); })
   };
