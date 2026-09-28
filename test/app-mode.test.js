@@ -386,3 +386,276 @@ test("two requests at once (picture + sound) do not lose each other's bookkeepin
   assert.equal(Object.keys(state.totals).length, 2);
   assert.equal(Object.keys(state.heads).length, 2);
 });
+
+/* ------------------------------------------------------------------ 1.5.0: upstream kernel rules */
+
+const AUTO = { ...DEFAULTS, conns: "自动" };
+const LADDER = [8, 12, 16, 24, 32, 48];
+const everyMirrorProfile = (profile) => {
+  for (const pattern of ["*", "*ov.bilivideo.com", "cn-hk-eq-*"]) mock.state.profiles[pattern] = profile;
+};
+const writeState = (state) => loon.store.set("btr_ios_app_v2", JSON.stringify(state));
+
+test("automatic connection count: climbs while the App waits and more connections bring more", async () => {
+  await freshLoon(AUTO);
+  // every connection crawls on its own (30 KiB/s, far away) but they do not share a bottleneck
+  everyMirrorProfile({ latency: 200, rate: 30 * 1024 });
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const original = file("v720.m4s");
+  const result = await segmentPlayer({ proxyPort, url, size: original.length, segment: 1048576, stopAfterBytes: 8 * 1048576 });
+  assert.equal(sha(result.bytes), sha(original.subarray(0, 8 * 1048576)), "every byte in place");
+  assert.equal(loon.log.passedThrough, 0);
+  const state = loon.state();
+  assert.ok(state.auto.lvl >= 4, `climbed from 16 to at least 32 connections: now ${LADDER[state.auto.lvl]} (${JSON.stringify(state.auto.log)})`);
+  assert.ok(state.auto.log.every((step) => /App 等了|又要了一次/.test(step.m)), "every step up was because the App waited");
+  const speedAt = (level) => { const list = state.autoS.filter((s) => s.l === level); return list.reduce((a, s) => a + s.b, 0) / Math.max(1, list.reduce((a, s) => a + s.ms, 0)); };
+  assert.ok(speedAt(state.auto.lvl) > speedAt(2) * 2, `batches got quicker with more connections: ${speedAt(2).toFixed(0)} → ${speedAt(state.auto.lvl).toFixed(0)} B/ms`);
+  assert.ok(mock.stats.maxConcurrent > 16, `more than 16 connections at once in the end: ${mock.stats.maxConcurrent}`);
+});
+
+test("automatic connection count: a step that did not make batches quicker is taken back, and that level rests", async () => {
+  await freshLoon(AUTO);
+  const code = fs.readFileSync(SCRIPT, "utf8");
+  // A different file every time: the judgement is about the trial, not about how busy one stream is.
+  let cid = 1100;
+  const run = (range) => runLoonScript({ code, httpClientPort: mock.port, store: loon.store, timeoutMs: 30000, argument: loon.settings.argument, request: { url: mock.mediaUrl(AKAMAI, cid++, "v360", "iphone"), method: "GET", headers: { Range: range, "User-Agent": "bili-universal/1" } } });
+  await run("bytes=0-1048575");
+  // A trial of 24 connections (from 16) that started 11 s ago with a baseline of 800 B/ms; since
+  // then full batches at 24 made only ~500 B/ms.
+  const seed = (afterBps, extra = {}) => {
+    const state = loon.state();
+    const now = Date.now();
+    state.auto = { lvl: 3, at: now - 11000, why: "App 等了 2.0 秒", trial: { from: 2, to: 3, at: now - 11000, base: 800, stalled: false, ...extra }, rest: {}, log: [], steps: 1 };
+    state.autoS = [
+      { l: 2, b: 800000, ms: 1000, t: now - 15000 },
+      { l: 3, b: afterBps * 1000, ms: 1000, t: now - 8000 },
+      { l: 3, b: afterBps * 1000, ms: 1000, t: now - 4000 },
+      { l: 3, b: afterBps * 1000, ms: 1000, t: now - 1000 }
+    ];
+    writeState(state);
+  };
+  seed(500);
+  await run("bytes=4000000-4099999");
+  let state = loon.state();
+  assert.equal(LADDER[state.auto.lvl], 16, "back to where the trial started");
+  assert.equal(state.auto.trial, null);
+  assert.ok(state.auto.rest["3"] && state.auto.rest["3"].until > Date.now() && !state.auto.rest["3"].hard, "24 rests for a while (a soft rest)");
+  assert.match(state.auto.log.at(-1).m, /24 条没有比 16 条更快/);
+  // …and plain pressure does not climb into the resting level again
+  state.auto.at = Date.now() - 10000;
+  writeState(state);
+  mock.state.profiles["*"] = { latency: 1700, rate: 120 * 1024 };
+  await run("bytes=5000000-5999999");
+  state = loon.state();
+  assert.equal(LADDER[state.auto.lvl], 16, `a resting level is skipped only on a stall: ${JSON.stringify(state.auto.log)}`);
+  mock.resetProfiles();
+
+  seed(950);
+  await run("bytes=4100000-4199999");
+  state = loon.state();
+  assert.equal(LADDER[state.auto.lvl], 24, "a step that made batches quicker is kept");
+  assert.equal(state.auto.trial, null, "…and the trial is over");
+
+  seed(500, { stalled: true });
+  await run("bytes=4200000-4299999");
+  state = loon.state();
+  assert.equal(LADDER[state.auto.lvl], 24, "a stall during the trial proves nothing: the level stays");
+});
+
+test("a mirror that answers 412 / 429 (too many connections) steps the count down and keeps its place", async () => {
+  await freshLoon(AUTO);
+  const limited = ["upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com"];
+  for (const host of limited) mock.state.profiles[host] = { latency: 160, rate: 120 * 1024, limitConcurrent: 1, limitStatus: 429 };
+  mock.state.profiles["upos-sz-mirror08c.bilivideo.com"] = { latency: 160, rate: 120 * 1024, limitConcurrent: 1, limitStatus: 412 };
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const original = file("v720.m4s");
+  const result = await segmentPlayer({ proxyPort, url, size: original.length, segment: 1048576, stopAfterBytes: 6 * 1048576 });
+  assert.equal(sha(result.bytes), sha(original.subarray(0, 6 * 1048576)), "every byte in place");
+  assert.equal(loon.log.passedThrough, 0, "refused connections are retried elsewhere, nothing falls back");
+  const state = loon.state();
+  const refusals = limited.concat("upos-sz-mirror08c.bilivideo.com").reduce((sum, host) => sum + (mock.stats.hosts[host]?.limited || 0), 0);
+  assert.ok(refusals >= 1, "the mock did refuse connections");
+  assert.ok(state.stats.limited >= 1);
+  assert.ok(state.auto.lvl < 2, `stepped down from 16: now ${LADDER[state.auto.lvl]}`);
+  assert.match(state.auto.log[0].m, /限流/);
+  const rested = Object.keys(state.auto.rest).filter((level) => state.auto.rest[level].hard);
+  assert.ok(rested.includes("2"), `16 rests hard after the refusal: ${JSON.stringify(state.auto.rest)}`);
+  for (const host of limited) {
+    assert.ok(!(state.hosts[host]?.until > Date.now()), `${host} is not benched for limiting connections`);
+  }
+  assert.ok(limited.some((host) => (state.hosts[host]?.ok || 0) > 0), "the limiting mirrors still carried pieces");
+});
+
+test("a mirror that refuses one file (but serves others) is dropped for that file only", async () => {
+  await freshLoon();
+  const picky = "upos-sz-mirrorali.bilivideo.com";
+  mock.state.profiles[picky] = { latency: 100, rate: 200 * 1024, refuseKeys: ["v720"] };
+  const original360 = file("v360.m4s");
+  const warm = await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1001, "v360", "iphone"), size: original360.length, segment: 1048576, stopAfterBytes: 2 * 1048576 });
+  assert.equal(sha(warm.bytes), sha(original360.subarray(0, 2 * 1048576)));
+  assert.ok(loon.state().hosts[picky].ok > 0, "the mirror served the first file");
+  const original720 = file("v720.m4s");
+  const video = await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1001, "v720", "iphone"), size: original720.length, segment: 1048576, stopAfterBytes: 8 * 1048576 });
+  assert.equal(sha(video.bytes), sha(original720.subarray(0, 8 * 1048576)), "the refusals cost nothing but a retry");
+  assert.equal(loon.log.passedThrough, 0);
+  let state = loon.state();
+  const refusedDuring = mock.stats.hosts[picky].refused || 0;
+  assert.ok(refusedDuring >= 1, "it did refuse the second file");
+  // The first batch may have given the (fast) mirror several pieces at once, up to its 6
+  // connections; they are all refused together. After that the pair is dropped.
+  assert.ok(refusedDuring <= 6, `the pair is dropped after the first batch, not asked again and again: ${refusedDuring} refusals`);
+  assert.ok(state.hosts[picky].refused >= 1);
+  assert.ok(!(state.hosts[picky].until > Date.now()), "the mirror as a whole is not benched");
+  assert.ok(Object.keys(state.pairs).some((key) => key.startsWith(picky + " ") && state.pairs[key].n >= 2), JSON.stringify(state.pairs));
+  // the pair stays dropped for the rest of that file…
+  const more = await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1002, "v720", "iphone"), size: original720.length, segment: 1048576, stopAfterBytes: 1 });
+  assert.equal(more.bytes.length, 1048576);
+  // …while the mirror keeps serving other files at full speed
+  const bytesBefore = mock.stats.hosts[picky].bytes;
+  const audio = await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1001, "a96", "iphone"), size: file("a96.m4s").length, segment: 1048576 });
+  assert.equal(sha(audio.bytes), sha(file("a96.m4s")));
+  assert.ok(mock.stats.hosts[picky].bytes > bytesBefore, "the picky mirror carried bytes of the other file");
+  state = loon.state();
+  assert.ok(!(state.hosts[picky].until > Date.now()));
+});
+
+test("a mirror measured at under a twelfth of the fastest sits out, and is tried again once that is old", async () => {
+  await freshLoon();
+  const slow = "upos-sz-mirrorhw.bilivideo.com";
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const original = file("v720.m4s");
+  await segmentPlayer({ proxyPort, url, size: original.length, segment: 1048576, stopAfterBytes: 1048576 });
+  const seedSlow = (measuredAgo) => {
+    const state = loon.state();
+    const top = Math.max(...Object.values(state.hosts).map((item) => item.bps || 0));
+    state.hosts[slow] = { ...(state.hosts[slow] || {}), ok: 3, bad: 0, until: 0, streak: 0, bps: top / 20, at: Date.now() - measuredAgo };
+    // the cache would answer from memory; empty it so every request goes to the mirrors
+    for (const entry of state.cache) loon.store.set(`btr_ios_app_c:${entry.k}`, "");
+    state.cache = [];
+    writeState(state);
+  };
+  seedSlow(5000);
+  const before = mock.stats.hosts[slow]?.requests || 0;
+  const part = await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1003, "v720", "iphone"), size: original.length, segment: 1048576, stopAfterBytes: 4 * 1048576 });
+  assert.equal(sha(part.bytes), sha(original.subarray(0, 4 * 1048576)));
+  assert.equal((mock.stats.hosts[slow]?.requests || 0) - before, 0, "the very slow mirror got no piece");
+  const page = await runLoonScript({ code: fs.readFileSync(SCRIPT, "utf8"), store: loon.store, argument: loon.settings.argument, request: { url: "https://www.bilibili.com/__btr_app__/", method: "GET", headers: {} } });
+  assert.match(page.response.body, /太慢，暂不用/);
+  // measured long ago: it gets a probe again
+  seedSlow(5 * 60000);
+  const again = mock.stats.hosts[slow]?.requests || 0;
+  await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1004, "v720", "iphone"), size: original.length, segment: 1048576, stopAfterBytes: 3 * 1048576 });
+  assert.ok((mock.stats.hosts[slow]?.requests || 0) > again, "an old measurement does not keep a mirror out for good");
+});
+
+test("hedge copies go to a clearly faster mirror, not to an equally slow one", async () => {
+  await freshLoon();
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const original = file("v720.m4s");
+  await segmentPlayer({ proxyPort, url, size: original.length, segment: 1048576, stopAfterBytes: 2 * 1048576 });
+  // One mirror swallows the App's piece; every other mirror is measured about as fast as it.
+  const state = loon.state();
+  const hosts = Object.keys(state.hosts).filter((host) => (state.hosts[host].bps || 0) > 0);
+  assert.ok(hosts.length >= 6);
+  const stuck = hosts[0];
+  for (const host of hosts) state.hosts[host].bps = 100;
+  state.hosts[stuck].bps = 400;
+  for (const entry of state.cache) loon.store.set(`btr_ios_app_c:${entry.k}`, "");
+  state.cache = [];
+  writeState(state);
+  mock.state.profiles[stuck] = { dead: true };
+  const code = fs.readFileSync(SCRIPT, "utf8");
+  const t0 = Date.now();
+  const reply = await runLoonScript({ code, httpClientPort: mock.port, store: loon.store, timeoutMs: 30000, argument: { ...DEFAULTS, ahead: "关闭", cache: "关闭" }, request: { url: mock.mediaUrl(AKAMAI, 1005, "v720", "iphone"), method: "GET", headers: { Range: "bytes=0-399999", "User-Agent": "bili-universal/1" } } });
+  assert.equal(reply.response.status, 206, "the App still gets its bytes");
+  assert.deepEqual(Buffer.from(reply.response.body), original.subarray(0, 400000));
+  const took = Date.now() - t0;
+  // the first (1.4 s) copy may only go to a 1.5× faster mirror — there is none; the copies at 2.2 s
+  // (the App has waited long) may go anywhere and rescue it
+  assert.ok(took >= 2000 && took < 6000, `rescued by the late copy, not the early one: ${took} ms`);
+});
+
+test("status page in automatic mode, and the plugin file", async () => {
+  await freshLoon(AUTO);
+  await ffmpegLikePlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1001, "a96", "iphone") });
+  const page = await runLoonScript({ code: fs.readFileSync(SCRIPT, "utf8"), store: loon.store, argument: loon.settings.argument, request: { url: "https://www.bilibili.com/__btr_app__/", method: "GET", headers: {} } });
+  assert.match(page.response.body, /设置<\/td><td>自动连接数 · 预读/);
+  assert.match(page.response.body, /连接数<\/td><td>自动 · 现在 \d+ 条/);
+  assert.match(page.response.body, /来源节点<\/td><td>upos-hz-mirrorakam\.akamaized\.net × \d+/);
+  assert.match(page.response.body, /限流（412\/429）<\/td><td>0 次/);
+
+  const plugin = fs.readFileSync(path.join(ROOT, "dist", "BTR-iOS-App.plugin"), "utf8");
+  assert.match(plugin, /^conns = select,"自动",/m, "automatic is the default (the first choice)");
+  const mitm = /^hostname = (.+)$/m.exec(plugin)[1].split(/\s*,\s*/);
+  const covered = (host) => mitm.some((pattern) => new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(host));
+  // what the pink and the white (international) app are handed from overseas
+  for (const host of ["upos-hz-mirrorakam.akamaized.net", "upos-sz-mirrorcosov.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com", "cn-gdfs-ct-01-01.bilivideo.com", "upos-sz-mirrorali.bilivideo.com", "xy1x2x3x4xy.mcdn.bilivideo.cn", "www.bilibili.com"]) {
+    assert.ok(covered(host), `${host} is decrypted`);
+  }
+  for (const host of ["i0.hdslb.com", "api.bilibili.com", "app.bilibili.com", "grpc.biliapi.net", "example.akamaized.net"]) {
+    assert.ok(!covered(host), `${host} is left alone`);
+  }
+  const rule = /^http-request (\S+) script-path=\S+, tag=BTR App 模式,/m.exec(plugin)[1];
+  for (const sample of ["https://cn-gdfs-ct-01-01.bilivideo.com/upgcxcode/01/20/1001/1001-1-30080.m4s?e=1", "http://xy1x2x3x4xy.mcdn.bilivideo.cn:4483/upgcxcode/01/20/1001/1001-1-30280.m4s?e=1"]) {
+    assert.ok(new RegExp(rule).test(sample), `${sample} reaches the script`);
+  }
+});
+
+test("every mirror refusing one address: the App gets it straight from its own host, without waiting out the deadline", async () => {
+  await freshLoon();
+  await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1001, "v360", "iphone"), size: file("v360.m4s").length, segment: 1048576, stopAfterBytes: 1048576 });
+  // every mirror has served before…
+  const state = loon.state();
+  const everyMirror = [
+    "upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorali02.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-mirrorhwb.bilivideo.com", "upos-sz-mirrorbos.bilivideo.com", "upos-sz-mirror08c.bilivideo.com",
+    "upos-sz-mirror08h.bilivideo.com", "upos-sz-mirrorbd.bilivideo.com", "upos-sz-mirror14b.bilivideo.com",
+    "upos-sz-estgoss.bilivideo.com", "upos-sz-mirrorcos.bilivideo.com", "upos-sz-mirrorcosb.bilivideo.com",
+    "upos-sz-upcdntx.bilivideo.com", "upos-sz-upcdnbda2.bilivideo.com", "upos-sz-upcdnqn.bilivideo.com",
+    "upos-sz-upcdnws.bilivideo.com", "upos-sz-mirroraliov.bilivideo.com", "upos-sz-mirrorcosov.bilivideo.com",
+    "cn-hk-eq-01-01.bilivideo.com", "cn-hk-eq-01-03.bilivideo.com", "cn-hk-eq-bcache-01.bilivideo.com"
+  ];
+  for (const host of everyMirror) state.hosts[host] = { ...(state.hosts[host] || {}), ok: 3, bad: 0, streak: 0, until: 0, bps: state.hosts[host]?.bps || 80, at: Date.now() };
+  writeState(state);
+  // …and now every one of them refuses this file (the Akamai host the App asked keeps serving it)
+  for (const host of everyMirror) mock.state.profiles[host] = { latency: 20, rate: 0, refuseKeys: ["v720"] };
+  const code = fs.readFileSync(SCRIPT, "utf8");
+  const url = mock.mediaUrl(AKAMAI, 1001, "v720", "iphone");
+  const times = [];
+  for (let index = 0; index < 6; index += 1) {
+    const t0 = Date.now();
+    const result = await runLoonScript({ code, httpClientPort: mock.port, store: loon.store, timeoutMs: 30000, argument: { ...DEFAULTS, cache: "关闭", ahead: "关闭" }, request: { url, method: "GET", headers: { Range: `bytes=${index * 100000}-${index * 100000 + 99999}`, "User-Agent": "bili-universal/1" } } });
+    times.push(Date.now() - t0);
+    assert.ok(result && !result.response, "passed through to the App's own host");
+  }
+  assert.ok(Math.max(...times) < 2500, `never waits out the 8 s deadline: ${times.join(", ")} ms`);
+  const after = loon.state();
+  assert.ok(Object.keys(after.pairs).some((key) => key.includes("#")), "refusals are kept per address (file + signature)");
+  assert.ok(everyMirror.every((host) => !(after.hosts[host].until > Date.now())), "no mirror is benched as a whole for it");
+});
+
+test("a push-back from one stream survives the other stream's concurrent step", async () => {
+  await freshLoon(AUTO);
+  await segmentPlayer({ proxyPort, url: mock.mediaUrl(AKAMAI, 1001, "v360", "iphone"), size: file("v360.m4s").length, segment: 1048576, stopAfterBytes: 1048576 });
+  const state = loon.state();
+  state.auto = { v: "seed.1", lvl: 3, at: Date.now() - 60000, why: "", trial: null, rest: {}, log: [], steps: 5 };
+  writeState(state);
+  // the mirrors the stream knows best take one connection at a time and say 429 to a second one;
+  // the rest are slow to answer, so the run is still going when the other stream commits
+  everyMirrorProfile({ latency: 400, rate: 120 * 1024 });
+  for (const host of Object.keys(state.hosts)) mock.state.profiles[host] = { latency: 400, rate: 120 * 1024, limitConcurrent: 1 };
+  const code = fs.readFileSync(SCRIPT, "utf8");
+  const running = runLoonScript({ code, httpClientPort: mock.port, store: loon.store, timeoutMs: 30000, argument: loon.settings.argument, request: { url: mock.mediaUrl(AKAMAI, 1001, "v720", "iphone"), method: "GET", headers: { Range: "bytes=0-1048575", "User-Agent": "bili-universal/1" } } });
+  // meanwhile the other stream steps up and commits first
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const other = loon.state();
+  other.auto = { v: "other.1", lvl: 4, at: Date.now(), why: "App 等了 2.0 秒", trial: { from: 3, to: 4, at: Date.now(), base: 500, stalled: false }, rest: { 5: { until: Date.now() + 60000, hard: false } }, log: [{ t: Date.now(), n: 32, m: "App 等了 2.0 秒" }], steps: 6 };
+  writeState(other);
+  const reply = await running;
+  const merged = loon.state().auto;
+  assert.equal(reply.response?.status, 206, `the stream itself got its bytes from mirrors that still had room: ${JSON.stringify(loon.state().runs.at(-1))}`);
+  assert.equal(LADDER[merged.lvl], 16, `the push-back (24 → 16) wins over the concurrent step to 32: ${JSON.stringify(merged)}`);
+  assert.ok(merged.rest["3"] && merged.rest["3"].hard, "the refused level rests hard");
+  assert.ok(merged.rest["5"], "the other stream's rest is kept too");
+  assert.equal(merged.trial, null);
+});

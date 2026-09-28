@@ -15,6 +15,15 @@
  *     播放器读完会从下一个位置接着要；同一位置反复被要 → 保险丝跳闸，改回原样放行。
  *   - 任何一步出错、超时、节点不认这个地址：原样放行（$done({})），App 像没装插件一样工作。
  *
+ * 1.5.0 起跟进原版（油猴版 2026.9.27.1）下载内核里能用在 App 上的调度规则：
+ *   - 自动连接数：8 → 12 → 16 → 24 → 32 → 48，App 等得久了就加一档；每次加档都是一次试验，
+ *     10 秒后整体速度没有变快就退回并让这一档休息 90 秒；节点返回 412 / 429（限流）退一档，
+ *     3 分钟内不再升到被拒的那一档；
+ *   - 测得比最快节点慢 12 倍以上的节点暂时不用，测速过了 90 秒再重新试；
+ *   - 节点只拒绝某一个视频（它能给别的视频）时，只停用“这个节点 + 这个视频”，不停整个节点；
+ *   - 对冲副本只发给测得快 1.5 倍以上的节点；App 已经等了很久才不挑；
+ *   - 太小的子块测出来的速度主要是往返延迟，按大小打折计入，不把节点的测速压下去。
+ *
  * 统计页（Safari 打开 https://www.bilibili.com/__btr_app__/ ）还带三个小实验，告诉作者 Loon 在
  * $done 之后还让不让脚本继续跑、脚本自己发的请求会不会再触发脚本、存储能不能装下几 MB。
  *
@@ -60,6 +69,24 @@ var BTRA_HEDGE_BUDGET = 4;
 var BTRA_DEADLINE = 8000;
 var BTRA_CACHE_TTL = 10 * 60000;
 var BTRA_BEHIND_KEEP = 512 * 1024;
+// Automatic connection count (upstream 0.9.4.0, adapted): the ladder, where it starts, how long
+// between steps, how long a step is on trial, how long a fruitless / refused level rests.
+var BTRA_AUTO_LADDER = [8, 12, 16, 24, 32, 48];
+var BTRA_AUTO_START = 2;
+var BTRA_AUTO_STEP_MS = 2500;
+var BTRA_AUTO_TRIAL_MS = 10000;
+var BTRA_AUTO_WINDOW_MS = 20000;
+var BTRA_AUTO_REST_MS = 90000;
+var BTRA_AUTO_PUSHBACK_MS = 180000;
+var BTRA_AUTO_WAIT_MS = 1500;          // the App waiting longer than this for its bytes is pressure
+var BTRA_AUTO_STALL_MS = 3000;         // …longer than this, or asking again, counts as a stall
+var BTRA_AUTO_GAIN = 1.1;              // a step is kept only when it made batches at least this much quicker
+var BTRA_SLOW_SHARE = 12;              // a mirror under a twelfth of the fastest sits out (upstream)
+var BTRA_MEASURE_TTL = 90000;          // …until its measurement is this old; then it is tried again
+var BTRA_HEDGE_FASTER = 1.5;           // a hedge copy goes to a mirror measured this much faster
+var BTRA_SAMPLE_FULL = 48 * 1024;      // a piece this long measures speed; shorter ones mostly RTT
+var BTRA_PAIR_LIMIT = 2;               // refusals of one file before that mirror + file pair is dropped
+var BTRA_PAIR_TTL = 20 * 60000;
 
 (function btrIosAppMain() {
   "use strict";
@@ -98,9 +125,12 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         if (pair[0]) map[pair[0]] = pair.slice(1).join("=");
       }
     }
+    // "自动" (the default, as upstream) or a fixed number of connections.
     var conns = parseInt(map.conns !== undefined ? map.conns : map.threads, 10);
+    var fixed = conns >= 1 && conns <= 64;
     return {
-      conns: conns >= 1 && conns <= 64 ? conns : 32,
+      auto: !fixed,
+      conns: fixed ? conns : BTRA_AUTO_LADDER[BTRA_AUTO_START],
       aheadBytes: megabytes(map.ahead, 4, true),
       cacheBytes: megabytes(map.cache, 16, true),
       overseas: /海外|overseas/i.test(String(map.cdn || "")),
@@ -206,7 +236,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
    */
 
   function emptyState() {
-    return { v: 2, since: Date.now(), rr: 0, totals: {}, hosts: {}, recent: [], breaker: {}, streaks: {}, notes: {}, stats: {}, cache: [], heads: {}, flags: {}, runs: [] };
+    return { v: 2, since: Date.now(), rr: 0, totals: {}, hosts: {}, recent: [], breaker: {}, streaks: {}, notes: {}, stats: {}, cache: [], heads: {}, flags: {}, runs: [], auto: {}, autoS: [], pairs: {}, origins: {} };
   }
 
   function loadState() {
@@ -222,7 +252,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
   }
 
   function hostRecord(state, host) {
-    return state.hosts[host] || (state.hosts[host] = { ok: 0, bad: 0, late: 0, streak: 0, lateStreak: 0, until: 0, benches: 0, bps: 0 });
+    return state.hosts[host] || (state.hosts[host] = { ok: 0, bad: 0, late: 0, streak: 0, lateStreak: 0, until: 0, benches: 0, bps: 0, at: 0, refused: 0, limited: 0 });
   }
 
   function apply(state, op) {
@@ -260,11 +290,66 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     else if (kind === "head") state.heads[op[1]] = { pos: op[2], t: op[3] };
     else if (kind === "cadd") state.cache.push(op[1]);
     else if (kind === "cdel") state.cache = state.cache.filter(function (entry) { return entry.k !== op[1]; });
+    else if (kind === "auto") {
+      // op[2]: the version of the record this run's decision was based on (every write gets a new,
+      // unique one). If another run (the other stream) wrote in between, its decision stands; this
+      // run only adds the levels it rested, and a push-back (op[3] === "down") still lowers the level.
+      var current = state.auto || {};
+      var incoming = op[1];
+      if ((current.v || "") === (op[2] || "")) state.auto = incoming;
+      else {
+        var merged = { v: incoming.v + "m", lvl: current.lvl, at: current.at, why: current.why, trial: current.trial || null, rest: {}, log: (current.log || []).slice(), steps: current.steps || 0 };
+        for (var mine in current.rest || {}) merged.rest[mine] = current.rest[mine];
+        for (var theirs in incoming.rest || {}) {
+          var had = merged.rest[theirs], add = incoming.rest[theirs];
+          if (!had || (add.hard && !had.hard) || (add.hard === had.hard && add.until > had.until)) merged.rest[theirs] = add;
+        }
+        if (op[3] === "down" && typeof merged.lvl === "number" && incoming.lvl < merged.lvl) {
+          merged.lvl = incoming.lvl; merged.trial = null; merged.at = incoming.at; merged.why = incoming.why;
+          var lastStep = incoming.log && incoming.log[incoming.log.length - 1];
+          if (lastStep) merged.log.push(lastStep);
+          while (merged.log.length > 8) merged.log.shift();
+          merged.steps += 1;
+        }
+        state.auto = merged;
+      }
+    }
+    else if (kind === "asample") {
+      state.autoS.push(op[1]);
+      while (state.autoS.length > 40 || (state.autoS.length && op[1].t - state.autoS[0].t > 60000)) state.autoS.shift();
+    }
+    else if (kind === "origin") {
+      var seenOrigin = state.origins[op[1]];
+      state.origins[op[1]] = { n: (seenOrigin && seenOrigin.n || 0) + 1, t: op[2] };
+    }
+    else if (kind === "refused") {
+      // This mirror serves other files but refused this one: only the pair is counted against.
+      var refusing = hostRecord(state, op[1]);
+      refusing.refused = (refusing.refused || 0) + 1;
+      var pairKey = op[1] + " " + op[2];
+      var pair = state.pairs[pairKey];
+      state.pairs[pairKey] = { n: (pair && op[3] - pair.t < BTRA_PAIR_TTL ? pair.n : 0) + 1, t: op[3] };
+    }
+    else if (kind === "probe") { var probed = hostRecord(state, op[1]); if (probed.bps > 0) probed.at = op[2]; }
+    else if (kind === "limited") {
+      // op[3]: how many connections the mirror was carrying for us when it said no — what it
+      // tolerates, for a while (0: it refused even a single one).
+      var limitedHost = hostRecord(state, op[1]);
+      limitedHost.limited = (limitedHost.limited || 0) + 1;
+      if (op[3] > 0) { limitedHost.cap = op[3]; limitedHost.capAt = op[2]; }
+    }
     else if (kind === "host") {
       var item = hostRecord(state, op[1]);
       if (op[2]) {
         item.ok += 1; item.streak = 0; item.lateStreak = 0; item.until = 0; item.benches = 0;
-        if (op[4] > 0) item.bps = item.bps ? item.bps * 0.7 + op[4] * 0.3 : op[4];
+        // A first sample from a short piece is mostly round trip: it gives a speed to start from, but
+        // not one to leave the mirror out on (it stays "old", so a slow-looking mirror is re-probed
+        // with an ordinary piece first).
+        if (op[5] >= BTRA_SAMPLE_FULL || item.bps > 0 || !(op[5] > 0)) item.at = op[3];
+        // A short piece is mostly round trip and would mark the mirror down: its sample counts for
+        // less the shorter it is (upstream ignores transfers under 48 KB for the same reason).
+        var weight = 0.3 * (op[5] > 0 ? Math.min(1, op[5] / BTRA_SAMPLE_FULL) : 1);
+        if (op[4] > 0) item.bps = item.bps ? item.bps * (1 - weight) + op[4] * weight : op[4];
       } else {
         item.bad += 1;
         item.streak += 1;
@@ -329,6 +414,34 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
         heads.sort(function (a, b) { return fresh.heads[a].t - fresh.heads[b].t; });
         for (var drop = 0; drop < heads.length - 16; drop += 1) delete fresh.heads[heads[drop]];
       }
+      var pairNames = [];
+      for (var pairName in fresh.pairs) {
+        if (!(now - fresh.pairs[pairName].t < BTRA_PAIR_TTL)) delete fresh.pairs[pairName];
+        else pairNames.push(pairName);
+      }
+      if (pairNames.length > 80) {
+        pairNames.sort(function (a, b) { return fresh.pairs[a].t - fresh.pairs[b].t; });
+        for (var pairCut = 0; pairCut < pairNames.length - 60; pairCut += 1) delete fresh.pairs[pairNames[pairCut]];
+      }
+      var originNames = [];
+      for (var originName in fresh.origins) {
+        if (typeof fresh.origins[originName] !== "object") delete fresh.origins[originName];
+        else originNames.push(originName);
+      }
+      if (originNames.length > 16) {
+        // the most recently seen ones stay
+        originNames.sort(function (a, b) { return fresh.origins[b].t - fresh.origins[a].t; });
+        for (var originCut = 12; originCut < originNames.length; originCut += 1) delete fresh.origins[originNames[originCut]];
+      }
+      // Fuses and failure streaks are kept per origin host; with every regional node decrypted
+      // there can be many of them. Expired fuses and cleared streaks go.
+      for (var fuse in fresh.breaker) if (!(fresh.breaker[fuse] && fresh.breaker[fuse].until > now)) delete fresh.breaker[fuse];
+      var streakNames = [];
+      for (var streakName in fresh.streaks) {
+        if (!fresh.streaks[streakName]) delete fresh.streaks[streakName];
+        else streakNames.push(streakName);
+      }
+      for (var streakCut = 0; streakCut < streakNames.length - 40; streakCut += 1) delete fresh.streaks[streakNames[streakCut]];
       var dropped = evict(fresh, now);
       $persistentStore.write(JSON.stringify(fresh), BTRA_STORE_KEY);
       for (var d = 0; d < dropped.length; d += 1) {
@@ -393,6 +506,123 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     if (state.notes[key] && now - state.notes[key] < everyMs) return;
     change("note", key, now);
     try { $notification.post(title, subtitle, body); } catch (_error) {}
+  }
+
+  /* ------------------------------------------------------------ automatic connection count
+   * Upstream's rule (0.9.4.0), fed with what an App-mode run can see. The browser version climbs when
+   * the player stalls or its buffer stops growing; here the signs are the App waiting for its own
+   * bytes (a batch whose App part took over BTRA_AUTO_WAIT_MS is pressure; over BTRA_AUTO_STALL_MS,
+   * or the App asking for the same position again while the last answer was slow or still pending,
+   * is a stall). Throughput is what full batches delivered per millisecond. It all lives in the
+   * shared record, so picture and sound, and every later run, climb the same ladder.
+   */
+
+  function autoLevel() {
+    var level = state.auto && typeof state.auto.lvl === "number" ? state.auto.lvl : BTRA_AUTO_START;
+    return level >= 0 && level < BTRA_AUTO_LADDER.length ? level : BTRA_AUTO_START;
+  }
+
+  // A private copy of the automatic state to change and write back as a whole (last writer wins —
+  // the two streams would compute the same step anyway).
+  function autoCopy(now) {
+    var current = state.auto || {};
+    var rest = {};
+    for (var level in current.rest || {}) if (current.rest[level] && current.rest[level].until > now) rest[level] = current.rest[level];
+    var trial = null;
+    if (current.trial) trial = { from: current.trial.from, to: current.trial.to, at: current.trial.at, base: current.trial.base, stalled: !!current.trial.stalled };
+    return { v: current.v || "", lvl: autoLevel(), at: current.at || 0, why: current.why || "", trial: trial, rest: rest, log: (current.log || []).slice(-7), steps: current.steps || 0 };
+  }
+
+  // Writes the automatic state back, noting which version of it this run's decision was based on
+  // (see the "auto" op). kind "down": a push-back, which must survive the other stream's write.
+  var autoWrites = 0;
+  function autoWrite(next, kind) {
+    var basedOn = state.auto && state.auto.v || "";
+    autoWrites += 1;
+    next.v = runId + "." + autoWrites;
+    change("auto", next, basedOn, kind || "");
+  }
+
+  function autoSet(next, now, why, kind) {
+    next.at = now;
+    next.why = why;
+    next.steps += 1;
+    next.log.push({ t: now, n: BTRA_AUTO_LADDER[next.lvl], m: why });
+    while (next.log.length > 8) next.log.shift();
+    autoWrite(next, kind);
+  }
+
+  // Bytes per millisecond that full batches at this level delivered between two moments.
+  function autoThroughput(level, from, to) {
+    var bytes = 0;
+    var ms = 0;
+    var count = 0;
+    for (var index = 0; index < state.autoS.length; index += 1) {
+      var sample = state.autoS[index];
+      if (sample.l === level && sample.t >= from && sample.t <= to) { bytes += sample.b; ms += sample.ms; count += 1; }
+    }
+    return { bps: ms > 0 ? bytes / ms : 0, count: count };
+  }
+
+  // Every step up is a trial. After BTRA_AUTO_TRIAL_MS the full batches since must be clearly quicker
+  // than the ones before it (BTRA_AUTO_GAIN: batch speeds are noisy, and "as quick as before" would
+  // let noise walk the count up the ladder), otherwise the step is taken back and that level rests
+  // for a while. Too few full batches meanwhile (the App had enough), or a stall during the trial,
+  // prove nothing: the level stays.
+  function autoJudge(now) {
+    var trial = state.auto && state.auto.trial;
+    if (!config.auto || !trial || now - trial.at < BTRA_AUTO_TRIAL_MS) return;
+    var next = autoCopy(now);
+    next.trial = null;
+    var after = autoThroughput(trial.to, trial.at, now);
+    if (trial.stalled || after.count < 2 || !(trial.base > 0) || after.bps >= trial.base * BTRA_AUTO_GAIN) { autoWrite(next); return; }
+    next.lvl = trial.from;
+    next.rest[trial.to] = { until: now + BTRA_AUTO_REST_MS, hard: false };
+    autoSet(next, now, BTRA_AUTO_LADDER[trial.to] + " 条没有比 " + BTRA_AUTO_LADDER[trial.from] + " 条更快，退回");
+  }
+
+  // One level up. A level resting after a refusal (412 / 429) caps the climb; one resting after a
+  // fruitless trial is skipped only on a stall.
+  function autoUp(now, why, strong) {
+    if (!config.auto) return false;
+    var next = autoCopy(now);
+    if (strong && next.trial && !next.trial.stalled) next.trial.stalled = true;
+    if (now - next.at < BTRA_AUTO_STEP_MS) {
+      if (strong && next.trial && !(state.auto.trial && state.auto.trial.stalled)) autoWrite(next);
+      return false;
+    }
+    var here = next.rest[next.lvl];
+    if (here && here.hard) return false;
+    // Pressure alone moves only a level that has shown what it does (a full batch since it was set),
+    // so that every trial has a baseline to beat, and not while a step is still on trial — each step
+    // gets judged. A stall moves at once.
+    if (!strong && autoThroughput(next.lvl, next.at, now).count < 1) return false;
+    if (!strong && next.trial && !next.trial.stalled && now - next.trial.at < BTRA_AUTO_TRIAL_MS) return false;
+    var target = next.lvl + 1;
+    while (target < BTRA_AUTO_LADDER.length && next.rest[target]) {
+      if (next.rest[target].hard || !strong) return false;
+      target += 1;
+    }
+    if (target >= BTRA_AUTO_LADDER.length) return false;
+    // The baseline: full batches at this level lately; failing that, any at this level; failing that,
+    // the running average over all batches. (A step without a baseline could never be judged.)
+    var base = autoThroughput(next.lvl, now - BTRA_AUTO_WINDOW_MS, now).bps || autoThroughput(next.lvl, 0, now).bps || state.stats.bps || 0;
+    next.trial = { from: next.lvl, to: target, at: now, base: base, stalled: false };
+    next.lvl = target;
+    autoSet(next, now, why);
+    return true;
+  }
+
+  // A mirror refused the load: one level down, and this level rests (hard) for a while.
+  function autoPushback(now, status) {
+    if (!config.auto) return;
+    var next = autoCopy(now);
+    next.rest[next.lvl] = { until: now + BTRA_AUTO_PUSHBACK_MS, hard: true };
+    next.trial = null;
+    if (next.lvl > 0) {
+      next.lvl -= 1;
+      autoSet(next, now, "节点返回 " + status + "（限流），退一档", "down");
+    } else autoWrite(next, "down");
   }
 
   /* ------------------------------------------------------------ cache entries */
@@ -516,14 +746,47 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var hosts = [];
     var liveHosts = 0;
     var benchedHosts = 0;
+    var slowCount = 0;
     var aggBps = 0;
-    for (var host in current.hosts) {
+    var topBps = 0;
+    for (var fastest in current.hosts) if (!(current.hosts[fastest].until > now) && current.hosts[fastest].bps > topBps) topBps = current.hosts[fastest].bps;
+    var hostNames = [];
+    for (var hostName in current.hosts) hostNames.push(hostName);
+    hostNames.sort(function (a, b) { return (current.hosts[b].bps || 0) - (current.hosts[a].bps || 0); });
+    for (var hn = 0; hn < hostNames.length; hn += 1) {
+      var host = hostNames[hn];
       var item = current.hosts[host];
+      var slow = !(item.until > now) && item.bps > 0 && item.bps < topBps / BTRA_SLOW_SHARE && now - (item.at || 0) < BTRA_MEASURE_TTL;
       if (item.until > now) benchedHosts += 1;
+      else if (slow) slowCount += 1;
       else if (item.bps > 0) { liveHosts += 1; aggBps += item.bps; }
-      hosts.push(escapeHtml(shortHost(host) + "：成功 " + (item.ok || 0) + " / 失败 " + (item.bad || 0) + " / 迟到 " + (item.late || 0) + (item.bps ? " · " + Math.round(item.bps * 1000 / 1024) + " KB/s" : "") + (item.until > now ? "（停用中）" : "")));
+      hosts.push(escapeHtml(shortHost(host) + "：成功 " + (item.ok || 0) + " / 失败 " + (item.bad || 0) + " / 迟到 " + (item.late || 0) +
+        (item.refused ? " / 拒绝单个视频 " + item.refused : "") + (item.limited ? " / 限流 " + item.limited : "") +
+        (item.bps ? " · " + Math.round(item.bps * 1000 / 1024) + " KB/s" : "") + (item.until > now ? "（停用中）" : slow ? "（太慢，暂不用）" : "")));
     }
-    var hostSummary = "在用 " + liveHosts + " 个镜像 · 合计约 " + Math.round(aggBps * 1000 / 1024) + " KB/s" + (benchedHosts ? " · 停用 " + benchedHosts + " 个" : "");
+    var pairCount = 0;
+    for (var pairName in current.pairs) if (current.pairs[pairName].n >= BTRA_PAIR_LIMIT && now - current.pairs[pairName].t < BTRA_PAIR_TTL) pairCount += 1;
+    var hostSummary = "在用 " + liveHosts + " 个镜像 · 合计约 " + Math.round(aggBps * 1000 / 1024) + " KB/s" + (benchedHosts ? " · 停用 " + benchedHosts + " 个" : "") +
+      (slowCount ? " · 太慢暂不用 " + slowCount + " 个" : "") + (pairCount ? " · 只对个别视频停用 " + pairCount + " 对" : "");
+    // Automatic connection count: where it is, why, and the last few steps.
+    var autoInfo = current.auto || {};
+    var autoLvl = typeof autoInfo.lvl === "number" && autoInfo.lvl >= 0 && autoInfo.lvl < BTRA_AUTO_LADDER.length ? autoInfo.lvl : BTRA_AUTO_START;
+    var connsText;
+    if (!config.auto) connsText = "固定 " + config.conns + " 条（插件参数里选“自动”可以让它自己调）";
+    else {
+      connsText = "自动 · 现在 " + BTRA_AUTO_LADDER[autoLvl] + " 条" + (autoInfo.why ? "（" + autoInfo.why + "）" : "（起步）");
+      if (autoInfo.trial && now - autoInfo.trial.at < BTRA_AUTO_TRIAL_MS * 3) connsText += " · 正在试 " + BTRA_AUTO_LADDER[autoInfo.trial.to] + " 条是否更快";
+      var resting = [];
+      for (var restLevel in autoInfo.rest || {}) if (autoInfo.rest[restLevel].until > now) resting.push(BTRA_AUTO_LADDER[restLevel] + " 条" + (autoInfo.rest[restLevel].hard ? "（被限流）" : "") + "休息 " + Math.ceil((autoInfo.rest[restLevel].until - now) / 1000) + " 秒");
+      if (resting.length) connsText += " · " + resting.join("、");
+      var steps = (autoInfo.log || []).slice().reverse();
+      for (var st = 0; st < steps.length; st += 1) if (steps[st] && steps[st].t) connsText += "\n" + new Date(steps[st].t).toLocaleTimeString() + " → " + steps[st].n + " 条：" + steps[st].m;
+    }
+    var originList = [];
+    for (var originName in current.origins) originList.push(originName);
+    originList = originList.filter(function (name) { return current.origins[name] && typeof current.origins[name] === "object"; });
+    originList.sort(function (a, b) { return current.origins[b].n - current.origins[a].n; });
+    var originText = originList.slice(0, 8).map(function (name) { return escapeHtml(name + " × " + current.origins[name].n); }).join("<br>");
     var cached = 0;
     for (var c = 0; c < current.cache.length; c += 1) cached += current.cache[c].b;
     var test = current.flags.storeTest;
@@ -543,8 +806,10 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var hist = "≤256K " + (stats.h256 || 0) + " · ≤1M " + (stats.h1m || 0) + " · ≤2M " + (stats.h2m || 0) + " · ≤4M " + (stats.h4m || 0) + " · >4M " + (stats.hbig || 0);
     var rows = [
       ["版本", escapeHtml(BTRA_VERSION)],
-      ["设置", escapeHtml(config.conns + " 条连接 · 预读 " + (config.aheadBytes ? sizeText(config.aheadBytes) : "关") + " · 缓存上限 " + (config.cacheBytes ? sizeText(config.cacheBytes) : "关") + " · " + (config.overseas ? "海外 CDN" : "大陆 CDN") + " · 大范围请求：" + (config.chunkReplies ? "分块答复" : "原样放行"))],
+      ["设置", escapeHtml((config.auto ? "自动连接数" : config.conns + " 条连接") + " · 预读 " + (config.aheadBytes ? sizeText(config.aheadBytes) : "关") + " · 缓存上限 " + (config.cacheBytes ? sizeText(config.cacheBytes) : "关") + " · " + (config.overseas ? "海外 CDN" : "大陆 CDN") + " · 大范围请求：" + (config.chunkReplies ? "分块答复" : "原样放行"))],
       ["统计起点", escapeHtml(new Date(current.since).toLocaleString())],
+      ["连接数", escapeHtml(connsText).replace(/\n/g, "<br>")],
+      ["来源节点", originText || "还没有记录"],
       ["看到的取流请求", escapeHtml((stats.seen || 0) + " 个（小段 " + (stats.bounded || 0) + " · 开放式 " + (stats.open || 0) + " · 无 Range " + (stats.none || 0) + " · 其他 " + (stats.other || 0) + "）")],
       ["请求大小分布", escapeHtml(hist + " · 最大 " + sizeText(stats.maxAsked || 0))],
       ["重复位置", escapeHtml((stats.dups || 0) + " 次：上一次答复还没完成 " + (stats.dupPending || 0) + " · 上次答得慢 " + (stats.dupSlow || 0) + " · 上次答得快 " + (stats.dupQuick || 0) + " · 上次是分块答复 " + (stats.dupShort || 0) + " · 上次放行/失败 " + (stats.dupFail || 0) + (stats.dupAfterMinMs ? "（重问之前那次答复用了 " + stats.dupAfterMinMs + "～" + stats.dupAfterMaxMs + " ms）" : ""))],
@@ -558,6 +823,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       ["原样放行", escapeHtml((stats.passed || 0) + " 次" + (stats.lastPass ? "（最近一次原因：" + stats.lastPass + "）" : ""))],
       ["失败后放行", escapeHtml((stats.failed || 0) + " 次" + (stats.lastError ? "（最近一次：" + stats.lastError + "）" : ""))],
       ["保险丝", breakers.length ? breakers.join("<br>") : "没有跳闸"],
+      ["限流（412/429）", escapeHtml((stats.limited || 0) + " 次" + (stats.limited ? (config.auto ? "（被拒时开着多条连接的话，自动连接数退一档；那个节点 3 分钟内少给连接）" : "（连接数调小一些，或改成“自动”）") : ""))],
       ["节点", hosts.length ? hostSummary + "<br>" + hosts.join("<br>") : "还没有记录"],
       ["答复之后才到的块", escapeHtml((stats.late || 0) + " 块补存进了缓存（Loon 通常在答复后立刻结束脚本，所以这个数一般是 0）")],
       ["最近 12 次", runLines.length ? runLines.join("<br>") : "还没有记录"],
@@ -604,9 +870,14 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var path = parts[4];
     var query = parts[5] || "";
     var pathKey = pathKeyOf(path);
+    // Refusals are remembered per address: the file plus its signature. A freshly signed address for
+    // the same file (after a long pause the old one expires and every mirror refuses it) starts clean.
+    var signature = /[?&]upsig=([0-9A-Za-z]{1,12})/.exec(parts[5] || "");
+    var addressKey = pathKey + (signature ? "#" + signature[1] : "");
     var now = Date.now();
     change("bump", "seen", 1);
     change("rr");
+    change("origin", originHost, now);
     var agent = header(request.headers, "User-Agent").slice(0, 80);
     if (agent && agent !== state.stats.agent) change("set", "agent", agent);
 
@@ -652,6 +923,14 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       // is a hint of how long the App is prepared to wait.
       if (previous.o === "ok" && previous.ms) { change("min", "dupAfterMinMs", previous.ms); change("max", "dupAfterMaxMs", previous.ms); }
     }
+    // Automatic connection count: judge a step that has had its time; the App asking again because
+    // the last answer was slow (or never came) is a stall.
+    autoJudge(now);
+    if (repeats && previous && (!previous.o || ((previous.o === "ok" || previous.o === "short") && previous.ms > BTRA_AUTO_WAIT_MS))) {
+      autoUp(now, "App 又要了一次同一段（上次答得慢）", true);
+    }
+    if (config.auto) config.conns = BTRA_AUTO_LADDER[autoLevel()];
+    var runLevel = autoLevel();
     if (bounded && wantedEnd - start + 1 > (state.stats.maxAsked || 0)) change("set", "maxAsked", wantedEnd - start + 1);
     change("head", pathKey, start, now);
 
@@ -673,14 +952,57 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     // out who actually carries the load. A mirror resting after repeated hard failures is skipped.
     var preferred = config.overseas ? BTRA_OVERSEAS : BTRA_MAINLAND;
     var everyMirror = preferred.concat(BTRA_MAINLAND, BTRA_OVERSEAS).filter(function (host, index, all) { return all.indexOf(host) === index; });
-    var pool = everyMirror.filter(function (host) { return !(state.hosts[host] && state.hosts[host].until > now); });
-    if (pool.length < 2) pool = everyMirror.slice();
+    // Left out for this file: a mirror that serves other files but has refused this one (twice,
+    // lately — upstream: "只停用这一个组合，不会把整个节点停掉"); within one run a single refusal will do.
+    var refusedHere = {};
+    function leftOut(host) {
+      if (refusedHere[host]) return true;
+      var pair = state.pairs[host + " " + addressKey];
+      return !!pair && pair.n >= BTRA_PAIR_LIMIT && now - pair.t < BTRA_PAIR_TTL;
+    }
+    // How many connections a mirror takes at once: BTRA_PER_HOST, or fewer while it is known to turn
+    // more away (412 / 429 with some of ours open: it keeps what it had, for BTRA_AUTO_PUSHBACK_MS).
+    var capHere = {};
+    function hasRoom(host) {
+      var cap = capOf(host);
+      return (hostInflight[host] || 0) + (cap < BTRA_PER_HOST ? busyCount(host) : 0) < cap;
+    }
+    function capOf(host) {
+      if (capHere[host]) return capHere[host];
+      var record = state.hosts[host];
+      return record && record.cap > 0 && now - (record.capAt || 0) < BTRA_AUTO_PUSHBACK_MS ? Math.min(BTRA_PER_HOST, record.cap) : BTRA_PER_HOST;
+    }
+    var allowed = everyMirror.filter(function (host) { return !leftOut(host); });
+    // Every mirror has refused this very address lately (an expired signature, content the mirrors do
+    // not carry): nothing to try, let the App fetch it itself at once.
+    if (!allowed.length) { passThrough("所有镜像都拒绝了这个地址"); return; }
+    var pool = allowed.filter(function (host) { return !(state.hosts[host] && state.hosts[host].until > now); });
+    if (pool.length < 2) pool = allowed.slice();
     var speedOf = function (host) { var record = state.hosts[host]; return record && record.bps > 0 ? record.bps : 0; };
     var triesOf = function (host) { var record = state.hosts[host]; return record ? (record.ok || 0) + (record.bad || 0) + (record.late || 0) : 0; };
+    var measuredAt = function (host) { var record = state.hosts[host]; return record && record.at || 0; };
     var knownHosts = pool.filter(function (host) { return speedOf(host) > 0; }).sort(function (a, b) { return speedOf(b) - speedOf(a); });
     var unknownHosts = pool.filter(function (host) { return speedOf(host) <= 0; }).sort(function (a, b) { return triesOf(a) - triesOf(b); });
     var assumedBps = knownHosts.length ? speedOf(knownHosts[Math.floor(knownHosts.length / 2)]) : BTRA_ASSUMED_BPS;
     var fresh = knownHosts.length < 3;
+    // Upstream 0.9.3.0: a mirror measured at under a twelfth of the fastest sits out — whatever it
+    // starts has to be rescued anyway, and its connection is better spent on a quick mirror. Once its
+    // measurement is BTRA_MEASURE_TTL old it counts as unmeasured again and gets a probe. (Only
+    // relative to the fastest: when every mirror crawls, all of them stay in and are summed.)
+    var slowHosts = [];
+    if (!fresh) {
+      var floorBps = speedOf(knownHosts[0]) / BTRA_SLOW_SHARE;
+      var quick = [];
+      var retry = [];
+      for (var kh = 0; kh < knownHosts.length; kh += 1) {
+        if (speedOf(knownHosts[kh]) >= floorBps) quick.push(knownHosts[kh]);
+        else if (now - measuredAt(knownHosts[kh]) >= BTRA_MEASURE_TTL) retry.push(knownHosts[kh]);
+        else slowHosts.push(knownHosts[kh]);
+      }
+      // Mirrors that did work before are more promising probes than ones that never answered.
+      if (quick.length >= 2) { knownHosts = quick; unknownHosts = retry.concat(unknownHosts); }
+      else slowHosts = [];
+    }
     // Connections that another run (the other stream) is using right now still occupy the mirror:
     // every run notes its connections under a shared key while it works and takes them out at the end.
     var busy = {};
@@ -707,10 +1029,16 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       // unmeasured mirrors so a wide pool is learned. Only then are spare connections handed back to
       // the fastest mirrors, up to BTRA_PER_HOST each, counting whatever the other stream is using.
       var perHostCount = {};
-      var roomFor = function (host) { return BTRA_PER_HOST - busyCount(host) - (perHostCount[host] || 0); };
+      var roomFor = function (host) { return capOf(host) - busyCount(host) - (perHostCount[host] || 0); };
       var pushSlot = function (host, explore) {
         perHostCount[host] = (perHostCount[host] || 0) + 1;
-        slots.push({ host: host, bps: speedOf(host) || Math.min(assumedBps, BTRA_ASSUMED_BPS), explore: !!explore });
+        var bps = speedOf(host) || Math.min(assumedBps, BTRA_ASSUMED_BPS);
+        // A mirror re-tried after sitting out is probed with an ordinary piece, as if it were a
+        // middling mirror: a tiny one would measure mostly round trip and could never show that it
+        // has recovered. Every probe is at least the smallest piece.
+        if (explore && speedOf(host) > 0) bps = Math.max(bps, assumedBps);
+        if (explore) bps = Math.max(bps, BTRA_MIN_SLOT / BTRA_SLICE_MS);
+        slots.push({ host: host, bps: bps, explore: !!explore });
       };
       for (var k = 0; k < knownHosts.length && slots.length < config.conns; k += 1) {
         if (roomFor(knownHosts[k]) > 0) pushSlot(knownHosts[k], false);
@@ -931,20 +1259,26 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     var results = new Array(pieces.length);
     var fetchedBytes = 0;
     var hedges = 0;
+    var pushedBack = false;
 
     function strikePending(reason) {
-      // Mirrors whose pieces are still outstanding well after their slice time get a "late" mark:
-      // their speed estimate drops (smaller pieces next time), and three in a row bench them.
+      // Mirrors whose pieces are still outstanding well after their slice time get a "late" mark —
+      // counted only (see the "late" op): it neither lowers their speed nor benches them.
       var lateLine = Date.now() - (BTRA_SLICE_MS + 300);
       var marked = {};
       for (var index = 0; index < tasks.length; index += 1) {
         var task = tasks[index];
         if (task.done || task.inflight <= 0 || !task.launchedAt) continue;
-        // An exploration piece gets no margin: a mirror that cannot deliver its small piece in the
-        // slice time is not one to explore again soon. One mark per mirror per batch.
         var lateHost = task.used[task.used.length - 1];
         if (marked[lateHost]) continue;
-        if (task.launchedAt < lateLine || (task.piece.slot.explore && task.launchedAt < Date.now() - BTRA_SLICE_MS)) { marked[lateHost] = true; change("late", lateHost, Date.now(), reason); }
+        // A probe that has not delivered by the end of the batch always gets its mark: that is how a
+        // mirror that swallows requests stops being the first one probed every time (its probes are
+        // abandoned with the run, so it would never be found out otherwise). One mark per mirror per batch.
+        if (task.piece.slot.explore) {
+          marked[lateHost] = true;
+          change("late", lateHost, Date.now(), reason);
+          change("probe", lateHost, Date.now());
+        } else if (task.launchedAt < lateLine) { marked[lateHost] = true; change("late", lateHost, Date.now(), reason); }
       }
     }
 
@@ -1009,16 +1343,25 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     }
 
     // Retries and hedges go to the fastest mirror that still has a free connection and has not
-    // been asked for this piece; mirrors that answered in this very run count as fastest.
-    function pickHost(piece, attempt, used) {
-      if (attempt === 0 && used.indexOf(piece.slot.host) < 0) return piece.slot.host;
-      var candidates = goodHosts.concat(knownHosts, unknownHosts, pool);
+    // been asked for this piece; mirrors that answered in this very run come first. A hedge copy
+    // (upstream 0.9.4.1) only goes to a mirror measured BTRA_HEDGE_FASTER times faster than the one
+    // it backs up — a copy on an equally slow mirror only takes a connection from the next piece.
+    // Once the App has waited long (copy.late) any mirror will do.
+    function pickHost(piece, attempt, used, copy) {
+      if (attempt === 0 && used.indexOf(piece.slot.host) < 0 && !leftOut(piece.slot.host) && hasRoom(piece.slot.host)) return piece.slot.host;
+      var proven = goodHosts.slice().sort(function (a, b) { return speedOf(b) - speedOf(a); });
+      var candidates = proven.concat(knownHosts, unknownHosts, pool);
+      var floor = copy && !copy.late && used.length ? speedOf(used[used.length - 1]) * BTRA_HEDGE_FASTER : 0;
       var seen = {};
       for (var index = 0; index < candidates.length; index += 1) {
         var host = candidates[index];
-        if (seen[host] || used.indexOf(host) >= 0) continue;
+        if (seen[host] || used.indexOf(host) >= 0 || leftOut(host)) continue;
         seen[host] = true;
-        if ((hostInflight[host] || 0) < BTRA_PER_HOST) return host;
+        // (Upstream also allows a mirror not measured yet. Here an unmeasured mirror may well be one
+        // that swallows requests — its probes are abandoned when a run ends, so it is never found
+        // out — and a copy sent there helps nobody. It gets copies only once the App has waited long.)
+        if (floor > 0 && speedOf(host) < floor) continue;
+        if (hasRoom(host)) return host;
       }
       return "";
     }
@@ -1041,21 +1384,45 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       for (var index = 0; index < must.length; index += 1) if (must[index].e > total - 1) must[index].e = total - 1;
     }
 
+    var waiting = [];
+    var hedgeWanted = [];
     function pump() {
+      for (var h = 0; h < hedgeWanted.length && !failed && !finished;) {
+        var wanted = hedgeWanted[h];
+        if (wanted.done || wanted.launched > 2 || wanted.launch({ late: true })) { hedgeWanted.splice(h, 1); continue; }
+        h += 1;
+      }
+      for (var w = 0; w < waiting.length && !failed && !finished;) {
+        var parked = waiting[w];
+        if (parked.done || parked.inflight > 0) { waiting.splice(w, 1); continue; }
+        if (parked.launch()) { waiting.splice(w, 1); continue; }
+        if (inflight === 0 || parked.launched >= 4) { giveUp("没有能用的镜像"); return; }
+        w += 1;
+      }
       while (queue.length && inflight < config.conns && !failed && !finished) {
-        var piece = queue.shift();
+        var piece = queue[0];
         if (!launchedAt) launchedAt = Date.now();
         var task = createTask(piece);
-        task.launch();
+        if (!task.launch()) {
+          // No mirror can take it right now. While connections are open one of them will free up
+          // (pump runs again then); with none open there is nowhere to send it at all.
+          tasks.pop();
+          if (inflight > 0) break;
+          queue.shift();
+          if (piece.extra) { extraLeft -= 1; continue; }
+          giveUp("没有能用的镜像");
+          return;
+        }
+        queue.shift();
         if (duplicateMust && !piece.extra) task.launch();
       }
     }
 
     function createTask(piece) {
       var task = { piece: piece, done: false, launched: 0, inflight: 0, used: [] };
-      task.launch = function () {
+      task.launch = function (copy) {
         if (task.done || failed || finished || task.launched >= (piece.extra ? 2 : 4)) return false;
-        var host = pickHost(piece, task.launched, task.used);
+        var host = pickHost(piece, task.launched, task.used, copy || null);
         if (!host) return false;
         if (!task.launched) task.launchedAt = Date.now();
         task.launched += 1;
@@ -1082,17 +1449,55 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
             return;
           }
           if (problem) {
-            change("host", host, false, Date.now());
+            var status = response ? Number(response.status) : 0;
+            // (The other stream's connections to that mirror count too: it sees them all.)
+            var carrying = (hostInflight[host] || 0) + busyCount(host);
+            if ((status === 412 || status === 429) && carrying > 0) {
+              // Too many connections for this mirror's taste (others to it were still open) — not a
+              // broken mirror (upstream 0.9.4.0): one level down on the automatic count; the mirror
+              // keeps its place but gets no more connections at once than it was carrying.
+              capHere[host] = carrying;
+              change("limited", host, Date.now(), carrying);
+              change("bump", "limited", 1);
+              if (!pushedBack) { pushedBack = true; autoPushback(Date.now(), status); }
+              // A refusal like this costs the piece none of its tries, and the mirror stays open to it
+              // once it has room again (its cap is now what it carries, and only goes down from here).
+              task.launched -= 1;
+              var usedAt = task.used.lastIndexOf(host);
+              if (usedAt >= 0) task.used.splice(usedAt, 1);
+            } else if (status === 412 || status === 429) {
+              // Refused although we had no other connection to it: it wants even fewer (other clients,
+              // or it has not noticed our last one close), or it refuses us for another reason. One
+              // connection at most for a while, and it counts as a failure; this piece looks elsewhere
+              // (it keeps the mirror in its list of tried ones), without that costing it a try.
+              capHere[host] = 1;
+              change("limited", host, Date.now(), 1);
+              change("bump", "limited", 1);
+              change("host", host, false, Date.now());
+              task.launched -= 1;
+            } else if (status >= 400 && status < 500 && state.hosts[host] && state.hosts[host].ok > 0) {
+              // A mirror that has served before refuses this file: count it against the pair only.
+              // One that refuses several different files lately is failing as a whole after all.
+              refusedHere[host] = true;
+              change("refused", host, addressKey, Date.now());
+              var refusedFiles = 0;
+              for (var pairName in state.pairs) if (pairName.indexOf(host + " ") === 0 && Date.now() - state.pairs[pairName].t < BTRA_PAIR_TTL) refusedFiles += 1;
+              if (refusedFiles >= 3) change("host", host, false, Date.now());
+            } else change("host", host, false, Date.now());
             if (!task.done) {
               if (!task.launch() && task.inflight === 0) {
                 if (piece.extra) { task.done = true; extraLeft -= 1; settle(); }
+                // No mirror has room right now, but connections are still open: it waits for one
+                // (pump tries it first); with none open, or its tries used up, the run gives up.
+                else if (inflight > 0 && task.launched < 4) waiting.push(task);
                 else giveUp(shortHost(host) + "：" + problem);
               }
             }
             pump();
+            settle();
             return;
           }
-          change("host", host, true, Date.now(), ms > 0 ? data.length / ms : 0);
+          change("host", host, true, Date.now(), ms > 0 ? data.length / ms : 0, data.length);
           if (goodHosts.indexOf(host) < 0) goodHosts.push(host);
           learnTotal(range ? range.total : 0, response);
           if (finished) return;
@@ -1114,7 +1519,7 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
           }
           pump();
           settle();
-          hedge(false);
+          hedge(false, false);
         });
         return true;
       };
@@ -1125,16 +1530,24 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
     // A mirror that swallows a request without answering would hold the whole reply up until its
     // timeout. When only stragglers are left (or the expected time has long passed), ask a mirror
     // that has just proved itself for the same bytes as well. Only the App's own bytes are worth it.
-    function hedge(byTimer) {
+    // `late`: the App has been waiting long enough that any mirror is worth a copy.
+    function hedge(byTimer, late) {
       if (failed || finished || !mustLeft) return;
       var open = 0;
       for (var index = 0; index < tasks.length; index += 1) if (!tasks[index].done && !tasks[index].piece.extra) open += 1;
       if (!open) return;
       if (!byTimer && (open > 2 || open === mustCount)) return;
-      var budget = BTRA_HEDGE_BUDGET - hedges;
+      // Once the App has waited long every stuck piece of its own gets a copy, however many there
+      // are (a mirror that went silent may hold several of them).
+      var budget = (late ? Math.max(BTRA_HEDGE_BUDGET * 2, hedges + open) : BTRA_HEDGE_BUDGET) - hedges;
       for (var pick = 0; pick < tasks.length && budget > 0; pick += 1) {
         var task = tasks[pick];
-        if (!task.done && !task.piece.extra && task.inflight >= 1 && task.launched <= 2 && task.launch()) { budget -= 1; hedges += 1; }
+        if (inflight >= config.conns + BTRA_HEDGE_BUDGET) break;
+        if (task.done || task.piece.extra || task.inflight < 1 || task.launched > 2) continue;
+        if (task.launch({ late: !!late })) { budget -= 1; hedges += 1; }
+        // Late, and every mirror is at its limit (read-ahead holds the connections): the copy goes
+        // out on the next connection that frees up, before any new read-ahead.
+        else if (late && hedgeWanted.indexOf(task) < 0) { hedgeWanted.push(task); budget -= 1; hedges += 1; }
       }
     }
 
@@ -1216,18 +1629,39 @@ var BTRA_BEHIND_KEEP = 512 * 1024;
       change("set", "lastCapacity", capacity);
       // Only batches that keep the connections busy say something about the speed; a small gap
       // filled with a few pieces is bound by latency, not throughput.
-      if (pieces.length >= slots.length / 2) change("ewma", "bps", fetchedBytes / batchMs);
+      var full = pieces.length >= slots.length / 2;
+      if (full) change("ewma", "bps", fetchedBytes / batchMs);
+      if (full && config.auto) change("asample", { l: runLevel, b: fetchedBytes, ms: batchMs, t: Date.now() });
+      // The App waiting for its own bytes is the sign that the connections are too few (a long wait
+      // counts as a stall). The level only climbs on it; whether that helped is judged later.
+      var waited = mustDoneAt - startedAt;
+      // The App asking for its next block as soon as it has the last one, and spending most of the
+      // last seconds waiting for this script, says the same as the browser's low, not growing buffer:
+      // the downloads are what holds playback back, even when each single answer is quick. (A player
+      // with a full buffer pauses between requests, or its requests hit the cache.)
+      var busyMs = elapsed;
+      var spanFrom = startedAt;
+      for (var rc = 0; rc < state.recent.length; rc += 1) {
+        var seenRun = state.recent[rc];
+        if (seenRun.p !== pathKey || seenRun.t === startedAt || !(seenRun.ms >= 0) || startedAt - seenRun.t > 12000) continue;
+        busyMs += seenRun.ms;
+        if (seenRun.t < spanFrom) spanFrom = seenRun.t;
+      }
+      var demand = Date.now() - spanFrom >= 3000 ? busyMs / (Date.now() - spanFrom) : 0;
+      if (waited > BTRA_AUTO_STALL_MS) autoUp(Date.now(), "App 等了 " + (waited / 1000).toFixed(1) + " 秒", true);
+      else if (waited > BTRA_AUTO_WAIT_MS && full) autoUp(Date.now(), "App 等了 " + (waited / 1000).toFixed(1) + " 秒", false);
+      else if (demand > 0.6 && full) autoUp(Date.now(), "App 一直在等数据（最近 " + Math.round(demand * 100) + "% 的时间）", false);
       if (state.streaks["origin:" + originHost]) change("streak", "origin:" + originHost, null);
-      notifyOnce("working", 6 * 3600000, "BTR App 模式正在加速", config.conns + " 连接 · " + (config.overseas ? "海外 CDN" : "大陆 CDN"), "刚才这一批 " + sizeText(fetchedBytes) + " 用了 " + (batchMs / 1000).toFixed(1) + " 秒（" + pieces.length + " 个子块）。统计页：" + BTRA_STATUS_URL);
+      notifyOnce("working", 6 * 3600000, "BTR App 模式正在加速", (config.auto ? "自动连接数（现在 " + config.conns + "）" : config.conns + " 连接") + " · " + (config.overseas ? "海外 CDN" : "大陆 CDN"), "刚才这一批 " + sizeText(fetchedBytes) + " 用了 " + (batchMs / 1000).toFixed(1) + " 秒（" + pieces.length + " 个子块）。统计页：" + BTRA_STATUS_URL);
       storeFetched();
       respond(body, cachedBytes, pieces.length, elapsed, { fetched: fetchedBytes, mustMs: mustDoneAt - startedAt, capacity: capacity, slots: slots.length });
     }
 
     if (typeof setTimeout === "function") {
       setTimeout(function () { giveUp("超过 " + Math.round(BTRA_DEADLINE / 1000) + " 秒还没拼齐"); }, BTRA_DEADLINE);
-      setTimeout(function () { hedge(true); }, Math.round(BTRA_SLICE_MS * 1.4));
-      setTimeout(function () { hedge(true); }, Math.round(BTRA_SLICE_MS * 2.2));
-      setTimeout(function () { hedge(true); }, Math.round(BTRA_SLICE_MS * 3.2));
+      setTimeout(function () { hedge(true, false); }, Math.round(BTRA_SLICE_MS * 1.4));
+      setTimeout(function () { hedge(true, true); }, Math.round(BTRA_SLICE_MS * 2.2));
+      setTimeout(function () { hedge(true, true); }, Math.round(BTRA_SLICE_MS * 3.2));
     }
     pump();
     if (!mustLeft) settle();

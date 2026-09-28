@@ -75,7 +75,8 @@ function createMock(options = {}) {
     apiDelay: 20,
     requireLogin: false,
     mediaCorsWwwOnly: false,
-    danmakuCors: false
+    danmakuCors: false,
+    totalRate: 0
   };
   const stats = { hosts: {}, concurrent: 0, maxConcurrent: 0, ranges: [], apiCalls: [], refererFailures: 0, signatureFailures: 0 };
   const openSockets = new Set();
@@ -230,6 +231,11 @@ function createMock(options = {}) {
       response.end(reason);
     };
     if (profile.status) return fail(profile.status, "mock: host refuses");
+    // A host that allows only so many connections at once and refuses the rest (rate limiting).
+    if (profile.limitConcurrent && counters.current >= profile.limitConcurrent) {
+      counters.limited = (counters.limited || 0) + 1;
+      return fail(profile.limitStatus || 429, "mock: too many connections");
+    }
     // Web play URLs are tied to a bilibili.com Referer; the apps' URLs (platform=iphone/android) are not.
     const referer = String(request.headers.referer || "");
     const appUrl = /^(?:iphone|android|ipad)$/.test(String(url.searchParams.get("platform") || ""));
@@ -240,6 +246,12 @@ function createMock(options = {}) {
     const match = /^\/upgcxcode\/\d+\/\d+\/(\d+)\/\d+-1-([0-9a-z]+)\.m4s$/i.exec(url.pathname);
     const item = match ? MEDIA[match[2]] : null;
     if (!item) return fail(404, "mock: no such media");
+    // A host that serves most files but refuses some (a mirror without that file, or one that does
+    // not accept that file's signature).
+    if (Array.isArray(profile.refuseKeys) && profile.refuseKeys.includes(match[2])) {
+      counters.refused = (counters.refused || 0) + 1;
+      return fail(403, "mock: host refuses this file");
+    }
     const akamai = /\.akamaized\.net$/i.test(host);
     if (url.searchParams.get("upsig") !== sign(url.pathname, Number(match[1])) || (akamai && !url.searchParams.get("hdnts"))) {
       stats.signatureFailures += 1;
@@ -281,7 +293,8 @@ function createMock(options = {}) {
         ...cors
       });
       const fd = fs.openSync(path.join(MEDIA_DIR, item.file), "r");
-      const chunkSize = rate ? Math.max(2048, Math.min(16384, Math.floor(rate / 8))) : 65536;
+      const nominal = rate || (state.totalRate ? state.totalRate / 16 : 0);
+      const chunkSize = nominal ? Math.max(2048, Math.min(16384, Math.floor(nominal / 8))) : 65536;
       let offset = start;
       let sent = 0;
       const pump = () => {
@@ -294,7 +307,11 @@ function createMock(options = {}) {
         offset += size;
         sent += size;
         counters.bytes += size;
-        const proceed = () => (rate ? setTimeout(pump, size * 1000 / rate) : setImmediate(pump));
+        // state.totalRate: one bottleneck shared by every connection (the user's own line), on top
+        // of each host's per-connection rate.
+        const shared = state.totalRate ? state.totalRate / Math.max(1, stats.concurrent) : 0;
+        const effective = rate && shared ? Math.min(rate, shared) : rate || shared;
+        const proceed = () => (effective ? setTimeout(pump, size * 1000 / effective) : setImmediate(pump));
         if (response.write(buffer)) proceed();
         else response.once("drain", proceed);
       };
@@ -442,7 +459,7 @@ function createMock(options = {}) {
     state,
     stats,
     resetStats,
-    resetProfiles() { state.profiles = defaultProfiles(); },
+    resetProfiles() { state.profiles = defaultProfiles(); state.totalRate = 0; },
     MEDIA,
     VIDEOS,
     mediaUrl,
